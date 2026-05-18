@@ -1,0 +1,18 @@
+{
+  "floors": 1,
+  "layouts": {
+    "0": {
+      "rooms": [],
+      "canvas_w": 440.0,
+      "canvas_h": 540.0,
+      "built_up_x": 20.0,
+      "built_up_y": 50.0,
+      "built_up_w": 260.0,
+      "built_up_h": 320.0,
+      "plot_w_px": 300.0,
+      "plot_h_px": 400.0,
+      "warnings": [],
+      "failed_rooms": []
+    }
+  }
+}

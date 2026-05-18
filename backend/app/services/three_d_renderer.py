@@ -1,0 +1,2505 @@
+"""
+three_d_renderer.py  —  Three.js 3D + Editable 2D SVG  v2.0
+=============================================================
+DROP-IN replacement for existing three_d_renderer.py.
+Same function signatures. Zero changes to visual_floor_plan.py.
+
+NEW in v2:
+  • 2D SVG floor plan is fully editable — drag rooms/furniture to reposition
+  • 3D: drag furniture (raycaster + plane intersection)
+  • 3D: proper staircase geometry (helical + straight flight options)
+  • 3D: realistic exterior — pitched roof, facade cladding, landscaping
+  • 3D: 7 camera presets (iso, top, front, back, side, walkthrough, cutaway)
+  • 3D: first-person WASD walkthrough mode
+  • 3D: multi-floor stacking with correct floor offsets
+  • 3D: all furniture types (bed, sofa, dining, kitchen, bath, desk, wardrobe, car)
+  • Panel: tabs for 2D Plan / 3D View / Camera / Rooms / Score
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# ── Room visual config ────────────────────────────────────────────────────────
+ROOM_COLORS: Dict[str, Dict[str, Any]] = {
+    "living_room":       {"color": "0xf5e6c8", "wallColor": "0xe8d5a3", "h": 3.6,  "label": "Living Room"},
+    "dining_room":       {"color": "0xfaf0dc", "wallColor": "0xe8d5a3", "h": 3.0,  "label": "Dining Room"},
+    "master_bedroom":    {"color": "0xdce8f5", "wallColor": "0xb8ccde", "h": 3.0,  "label": "Master Bedroom"},
+    "parents_bedroom":   {"color": "0xdce8f5", "wallColor": "0xb8ccde", "h": 3.0,  "label": "Parents Bedroom"},
+    "bedroom":           {"color": "0xe0e8f5", "wallColor": "0xbccade", "h": 3.0,  "label": "Bedroom"},
+    "kitchen":           {"color": "0xdcf5e8", "wallColor": "0xb3d9c4", "h": 2.7,  "label": "Kitchen"},
+    "dry_kitchen":       {"color": "0xe8f5ee", "wallColor": "0xbbd9ca", "h": 2.7,  "label": "Dry Kitchen"},
+    "wet_kitchen":       {"color": "0xdcf5e8", "wallColor": "0xb3d9c4", "h": 2.7,  "label": "Wet Kitchen"},
+    "bathroom":          {"color": "0xd8f0f8", "wallColor": "0xa8c8d8", "h": 2.4,  "label": "Bathroom"},
+    "common_bathroom":   {"color": "0xd8f0f8", "wallColor": "0xa8c8d8", "h": 2.4,  "label": "Common Bath"},
+    "guest_powder_room": {"color": "0xe0f0f8", "wallColor": "0xb0c8d8", "h": 2.4,  "label": "Powder Room"},
+    "corridor":          {"color": "0xf0ede4", "wallColor": "0xd8d0c0", "h": 2.7,  "label": "Corridor"},
+    "foyer":             {"color": "0xf8f4ec", "wallColor": "0xddd5c0", "h": 2.7,  "label": "Foyer"},
+    "sit_out":           {"color": "0xe8f4e0", "wallColor": "0xbcd4a8", "h": 0.0,  "label": "Sit-out"},
+    "car_porch":         {"color": "0xe8ede0", "wallColor": "0xbcc8a8", "h": 0.0,  "label": "Car Porch"},
+    "pooja_room":        {"color": "0xfff0d8", "wallColor": "0xe8d4a8", "h": 2.7,  "label": "Pooja Room"},
+    "walk_in_wardrobe":  {"color": "0xece8f5", "wallColor": "0xc8c0dd", "h": 2.4,  "label": "Walk-in WC"},
+    "utility_room":      {"color": "0xeceae4", "wallColor": "0xd0ccbf", "h": 2.4,  "label": "Utility Room"},
+    "store_room":        {"color": "0xe8e6e0", "wallColor": "0xccc8bc", "h": 2.4,  "label": "Store Room"},
+    "staircase":         {"color": "0xece8e0", "wallColor": "0xd0ccc0", "h": 3.0,  "label": "Staircase"},
+    "servant_quarters":  {"color": "0xeae8e2", "wallColor": "0xccc8be", "h": 2.7,  "label": "Servant Qtrs"},
+    "home_office":       {"color": "0xe8eef8", "wallColor": "0xbcc4d8", "h": 2.7,  "label": "Home Office"},
+    "guest_bedroom":     {"color": "0xe2e8f5", "wallColor": "0xb8c4de", "h": 3.0,  "label": "Guest Bedroom"},
+    "family_lounge":     {"color": "0xf2ece0", "wallColor": "0xd8d0b8", "h": 3.0,  "label": "Family Lounge"},
+    "terrace":           {"color": "0xe0e8d8", "wallColor": "0xb8c8a8", "h": 0.0,  "label": "Terrace"},
+    "balcony":           {"color": "0xe4ece0", "wallColor": "0xbccab0", "h": 0.0,  "label": "Balcony"},
+    "default":           {"color": "0xf5f3ee", "wallColor": "0xd8d4c8", "h": 2.7,  "label": "Room"},
+}
+
+DOUBLE_HEIGHT_MULT = 1.8
+FLOOR_STEP_M = 3.2   # 3.0m room + 0.2m slab
+
+
+def _cat(name: str) -> str:
+    n = name.lower()
+    if "master" in n and "bath" in n:     return "bathroom"
+    if "master" in n:                     return "master_bedroom"
+    if "parent" in n:                     return "parents_bedroom"
+    if "guest" in n and "bath" in n:      return "bathroom"
+    if "guest" in n:                      return "guest_bedroom"
+    if "bedroom" in n or "bed_" in n:     return "bedroom"
+    if "kitchen" in n and "dry" in n:     return "dry_kitchen"
+    if "kitchen" in n and "wet" in n:     return "wet_kitchen"
+    if "kitchen" in n:                    return "kitchen"
+    if "dining" in n:                     return "dining_room"
+    if "living" in n:                     return "living_room"
+    if "bath" in n or "toilet" in n:      return "bathroom"
+    if "powder" in n:                     return "guest_powder_room"
+    if "corridor" in n or "passage" in n: return "corridor"
+    if "foyer" in n:                      return "foyer"
+    if ("sit" in n and "out" in n) or "verandah" in n or "veranda" in n:
+        return "sit_out"
+    if "porch" in n or "parking" in n:    return "car_porch"
+    if "pooja" in n or "prayer" in n:     return "pooja_room"
+    if "wardrobe" in n or "wic" in n:     return "walk_in_wardrobe"
+    if "utility" in n or "laundry" in n:  return "utility_room"
+    if "store" in n:                      return "store_room"
+    if "stair" in n:                      return "staircase"
+    if "servant" in n or "maid" in n:     return "servant_quarters"
+    if "office" in n or "study" in n:     return "home_office"
+    if "lounge" in n or "family" in n:    return "family_lounge"
+    if "terrace" in n:                    return "terrace"
+    if "balcony" in n:                    return "balcony"
+    return "default"
+
+
+def _layout_room_cat(room: Dict) -> str:
+    """Prefer layout engine ``__cat`` when known; else infer from room name (matches SVG)."""
+    raw = str(room.get("__cat") or "").strip().lower()
+    if raw and raw in ROOM_COLORS:
+        return raw
+    return _cat(str(room.get("name", "")))
+
+
+def _room_cfg(room: Dict) -> Dict:
+    cat = _layout_room_cat(room)
+    return ROOM_COLORS.get(cat, ROOM_COLORS["default"])
+
+
+# Same px→m and wall thickness convention as inline Three.js (EXT_WALL_T / INT_WALL_T).
+_OPENING_PX2M = 0.03048
+_OPENING_EXT_T = 0.23
+_OPENING_INT_T = 0.115
+
+
+def _compute_wall_openings_3d(
+    room: Dict[str, Any],
+    bx: float,
+    by: float,
+    bw: float,
+    bh: float,
+) -> List[Dict[str, Any]]:
+    """
+    Wall punches + fitting positions aligned with svg_renderer (draw_window, draw_door,
+    draw_placed_openings_on_room). Emitted on rooms for the 3D viewer as __wall_openings:
+    [{\"wall\":\"N\"|\"S\"|\"W\"|\"E\", \"pos\":0..1 along that wall's extrusion length,
+      \"w_px\": number, \"kind\": \"window\"|\"door\"|\"door_main\", \"opening_only\"?: bool}]
+    """
+    try:
+        from .svg_renderer import (
+            DIM_SPC,
+            MARGIN,
+            cat as svg_cat,
+            ext_walls_of,
+            is_carved,
+            win_wall,
+        )
+    except ImportError:
+        return []
+
+    name = str(room.get("name", ""))
+    n = name.lower()
+    if room.get("__is_carved") or is_carved(n):
+        return []
+
+    is_st = ("staircase" in n and "landing" not in n) or ("staircase_landing" in n)
+    is_tr = "terrace" in n or "balcony" in n
+    if is_st or is_tr:
+        return []
+
+    rw = float(room.get("width") or 0)
+    rh = float(room.get("height") or 0)
+    if rw < 4 or rh < 4:
+        return []
+
+    ox = MARGIN + DIM_SPC
+    oy = MARGIN + DIM_SPC
+    rx = float(room.get("x", 0)) + ox
+    ry = float(room.get("y", 0)) + oy
+
+    ext_top, ext_bot, ext_left, ext_right = ext_walls_of(rx, ry, rw, rh, bx, by, bw, bh, ox, oy)
+    c = svg_cat(n)
+
+    rd_m = rh * _OPENING_PX2M
+    t_n = _OPENING_EXT_T if ext_top else _OPENING_INT_T
+    t_s = _OPENING_EXT_T if ext_bot else _OPENING_INT_T
+    inner_d_m = max(0.08, rd_m - t_n - t_s)
+
+    out: List[Dict[str, Any]] = []
+
+    def compass(edge: str) -> str:
+        return {"top": "N", "bot": "S", "left": "W", "right": "E"}.get(edge, "")
+
+    def push(wall: str, pos: float, w_px: float, kind: str, opening_only: bool = False) -> None:
+        if not wall:
+            return
+        pos_c = max(0.02, min(0.98, float(pos)))
+        item: Dict[str, Any] = {
+            "wall": wall,
+            "pos": round(pos_c, 5),
+            "w_px": round(float(w_px), 2),
+            "kind": kind,
+        }
+        if opening_only:
+            item["opening_only"] = True
+        out.append(item)
+
+    # ── Windows (same numeric layout as draw_window) ───────────────────────────
+    wc = int(room.get("windows", 0) or 0)
+    if wc > 0:
+        wl = win_wall(name, rx, ry, rw, rh, ext_top, ext_bot, ext_left, ext_right)
+        if wl not in ("none", ""):
+            count = min(max(wc, 1), 3)
+            span = (rw * 0.62) if wl in ("top", "bot") else (rh * 0.58)
+            pane = max(min(span / count, 36.0), 14.0)
+            edge_pad = 18.0
+            for i in range(count):
+                if wl in ("top", "bot"):
+                    a = rx + edge_pad
+                    b = rx + rw - edge_pad
+                    if count == 1:
+                        cx = (a + b) * 0.5
+                    else:
+                        cx = a + (b - a) * (i + 0.5) / count
+                    push(compass(wl), (cx - rx) / rw, pane, "window")
+                else:
+                    a = ry + edge_pad
+                    b = ry + rh - edge_pad
+                    if count == 1:
+                        cy = (a + b) * 0.5
+                    else:
+                        cy = a + (b - a) * (i + 0.5) / count
+                    u_svg = (cy - ry) / rh if rh else 0.5
+                    push(compass(wl), u_svg * (rd_m / inner_d_m), pane, "window")
+
+    edge_pad_d = 16.0
+
+    def door_dw(width_override_px: float) -> float:
+        if width_override_px and width_override_px > 1.0:
+            return float(width_override_px)
+        if rw < 60 or rh < 60:
+            return max(min(rw * 0.38, 22.0), 14.0)
+        dw0 = max(min(rw * 0.28, 32.0), 20.0)
+        return float(min(dw0, rw * 0.42, rh * 0.42))
+
+    layout_band = int(room.get("layout_band", -1) or -1)
+    preferred = str(room.get("__door_wall", "") or "").lower()
+
+    wall_i = ""
+    if preferred in ("top", "bot", "left", "right"):
+        if (preferred == "top" and not ext_top) or (preferred == "bot" and not ext_bot) or (
+            preferred == "left" and not ext_left
+        ) or (preferred == "right" and not ext_right):
+            wall_i = preferred
+
+    if not wall_i and c in (
+        "kitchen",
+        "wet_kitchen",
+        "dry_kitchen",
+        "utility_room",
+        "servant_quarters",
+        "home_office",
+    ):
+        wall_i = "left" if not ext_left else ("top" if not ext_top else "right")
+    elif not wall_i and c in (
+        "master_bedroom",
+        "bedroom",
+        "parents_bedroom",
+        "guest_bedroom",
+        "family_lounge",
+        "walk_in_wardrobe",
+    ):
+        wall_i = "top" if not ext_top else ("left" if not ext_left else "right")
+    elif not wall_i and c in ("bathroom", "common_bathroom", "guest_powder_room"):
+        if layout_band == 5:
+            wall_i = (
+                "left"
+                if not ext_left
+                else ("right" if not ext_right else ("top" if not ext_top else "bot"))
+            )
+        else:
+            wall_i = "top" if not ext_top else ("left" if not ext_left else "right")
+    elif not wall_i and c in ("pooja_room", "store_room", "foyer"):
+        wall_i = "top" if not ext_top else ("right" if not ext_right else "left")
+    elif not wall_i:
+        wall_i = (
+            "top"
+            if not ext_top
+            else ("left" if not ext_left else ("right" if not ext_right else "bot"))
+        )
+
+    if c in ("corridor", "passage", "staircase_landing", "car_porch", "staircase"):
+        wall_i = ""
+
+    def emit_door_svg(edge_svg: str, dw2: float, kind_tag: str, open_only: bool) -> None:
+        if edge_svg == "top":
+            hx = rx + (rw - dw2) * 0.5
+            hx = max(rx + edge_pad_d, min(hx, rx + rw - edge_pad_d - dw2))
+            push("N", (hx + dw2 / 2 - rx) / rw, dw2, kind_tag, open_only)
+        elif edge_svg == "bot":
+            hx = rx + (rw - dw2) * 0.5
+            hx = max(rx + edge_pad_d, min(hx, rx + rw - edge_pad_d - dw2))
+            push("S", (hx + dw2 / 2 - rx) / rw, dw2, kind_tag, open_only)
+        elif edge_svg == "left":
+            hy = ry + (rh - dw2) * 0.5
+            hy = max(ry + edge_pad_d, min(hy, ry + rh - edge_pad_d - dw2))
+            cy_c = hy + dw2 / 2
+            u_svg = (cy_c - ry) / rh if rh else 0.5
+            push("W", u_svg * (rd_m / inner_d_m), dw2, kind_tag, open_only)
+        else:
+            hy = ry + (rh - dw2) * 0.5
+            hy = max(ry + edge_pad_d, min(hy, ry + rh - edge_pad_d - dw2))
+            cy_c = hy + dw2 / 2
+            u_svg = (cy_c - ry) / rh if rh else 0.5
+            push("E", u_svg * (rd_m / inner_d_m), dw2, kind_tag, open_only)
+
+    kitchen_opening_only = c in ("kitchen", "wet_kitchen", "dry_kitchen")
+    dc = int(room.get("door_count", 0) or 0)
+    if dc > 0 and wall_i:
+        emit_door_svg(wall_i, door_dw(0.0), "door", kitchen_opening_only)
+
+    if room.get("__main_door"):
+        pref_m = str(room.get("__main_door") or "").lower()
+        wall_m = ""
+        if pref_m in ("top", "bot", "left", "right"):
+            if (pref_m == "top" and not ext_top) or (pref_m == "bot" and not ext_bot) or (
+                pref_m == "left" and not ext_left
+            ) or (pref_m == "right" and not ext_right):
+                wall_m = pref_m
+        if wall_m:
+            emit_door_svg(wall_m, door_dw(float(room.get("__main_door_px") or 0.0)), "door_main", False)
+
+    # ── User placed_openings (same as draw_placed_openings_on_room) ────────────
+    raw_po = room.get("placed_openings")
+    if isinstance(raw_po, list):
+        for op in raw_po:
+            if not isinstance(op, dict):
+                continue
+            edge = str(op.get("edge", "")).lower()
+            if edge == "bottom":
+                edge = "bot"
+            if edge not in ("top", "bot", "left", "right"):
+                continue
+            kind = str(op.get("kind", "door")).lower()
+            if kind not in ("door", "window"):
+                kind = "door"
+            u = max(0.0, min(1.0, float(op.get("u", 0.5))))
+            dw = float(op.get("width_px", 28.0 if kind == "door" else 22.0))
+            dw = max(14.0, min(dw, rw * 0.42, rh * 0.42))
+            wsvg = edge
+            if kind == "door":
+                span = max(0.1, rw - 2 * edge_pad_d - dw)
+                if edge == "top":
+                    hx = rx + edge_pad_d + span * u
+                    hx = max(rx + edge_pad_d, min(hx, rx + rw - edge_pad_d - dw))
+                    push("N", (hx + dw / 2 - rx) / rw, dw, "door", False)
+                elif edge == "bot":
+                    hx = rx + edge_pad_d + span * u
+                    hx = max(rx + edge_pad_d, min(hx, rx + rw - edge_pad_d - dw))
+                    push("S", (hx + dw / 2 - rx) / rw, dw, "door", False)
+                elif edge == "left":
+                    span = max(0.1, rh - 2 * edge_pad_d - dw)
+                    hy = ry + edge_pad_d + span * u
+                    hy = max(ry + edge_pad_d, min(hy, ry + rh - edge_pad_d - dw))
+                    cy_c = hy + dw / 2
+                    push("W", ((cy_c - ry) / rh) * (rd_m / inner_d_m), dw, "door", False)
+                else:
+                    span = max(0.1, rh - 2 * edge_pad_d - dw)
+                    hy = ry + edge_pad_d + span * u
+                    hy = max(ry + edge_pad_d, min(hy, ry + rh - edge_pad_d - dw))
+                    cy_c = hy + dw / 2
+                    push("E", ((cy_c - ry) / rh) * (rd_m / inner_d_m), dw, "door", False)
+            else:
+                pane = dw
+                if edge == "top":
+                    span = max(0.1, rw - 2 * edge_pad_d - pane)
+                    cx = rx + edge_pad_d + pane / 2 + span * u
+                    cx = max(rx + edge_pad_d + pane / 2, min(cx, rx + rw - edge_pad_d - pane / 2))
+                    push("N", (cx - rx) / rw, pane, "window")
+                elif edge == "bot":
+                    span = max(0.1, rw - 2 * edge_pad_d - pane)
+                    cx = rx + edge_pad_d + pane / 2 + span * u
+                    cx = max(rx + edge_pad_d + pane / 2, min(cx, rx + rw - edge_pad_d - pane / 2))
+                    push("S", (cx - rx) / rw, pane, "window")
+                elif edge == "left":
+                    span = max(0.1, rh - 2 * edge_pad_d - pane)
+                    cy = ry + edge_pad_d + pane / 2 + span * u
+                    cy = max(ry + edge_pad_d + pane / 2, min(cy, ry + rh - edge_pad_d - pane / 2))
+                    push("W", ((cy - ry) / rh) * (rd_m / inner_d_m), pane, "window")
+                else:
+                    span = max(0.1, rh - 2 * edge_pad_d - pane)
+                    cy = ry + edge_pad_d + pane / 2 + span * u
+                    cy = max(ry + edge_pad_d + pane / 2, min(cy, ry + rh - edge_pad_d - pane / 2))
+                    push("E", ((cy - ry) / rh) * (rd_m / inner_d_m), pane, "window")
+
+    return out
+
+
+def render_3d_html(
+    layout_data:  Dict[str, Any],
+    parsed:       Dict[str, Any],
+    score:        Optional[Dict[str, Any]] = None,
+    floor_label:  str = "GROUND FLOOR",
+    output_path:  Optional[str] = None,
+    floor_index:  int = 0,
+    all_floors:   Optional[List[Dict[str, Any]]] = None,   # NEW: pass all layouts for multi-floor 3D
+) -> str:
+    rooms: List[Dict] = layout_data.get("rooms") or []
+    bx = float(layout_data.get("built_up_x", 70))
+    by = float(layout_data.get("built_up_y", 120))
+    bw = float(layout_data.get("built_up_w", 260))
+    bh = float(layout_data.get("built_up_h", 420))
+    pw = float(layout_data.get("plot_w_px", 300))
+    ph = float(layout_data.get("plot_h_px", 500))
+    facing = str(layout_data.get("facing", parsed.get("plot_facing", "north"))).title()
+
+    bhk   = str(parsed.get("bhk_type", "3BHK"))
+    pw_ft = int(parsed.get("plot_width_ft", 30))
+    pd_ft = int(parsed.get("plot_depth_ft", 50))
+    style = str(parsed.get("style", "modern")).title()
+    vastu = bool(parsed.get("vastu_compliant", False))
+    num_floors = int(parsed.get("floors", 1) or 1)
+
+    enriched: List[Dict] = []
+    for r in rooms:
+        cfg  = _room_cfg(r)
+        dh   = str(r.get("name","")) in (parsed.get("double_height_rooms") or [])
+        wh   = cfg["h"] * (DOUBLE_HEIGHT_MULT if dh else 1.0)
+        cat  = _layout_room_cat(r)
+        row: Dict[str, Any] = {
+            **r,
+            "__cat_resolved": cat,
+            "__wall_h":       round(wh, 2),
+            "__color":        cfg["color"],
+            "__wallColor":    cfg["wallColor"],
+            "__label":        cfg["label"],
+            "__floor_y":      floor_index * FLOOR_STEP_M,
+        }
+        try:
+            row["__wall_openings"] = _compute_wall_openings_3d(r, bx, by, bw, bh)
+        except Exception:
+            row["__wall_openings"] = []
+        enriched.append(row)
+
+    # Build ALL rooms across all floors for multi-floor 3D
+    all_enriched: List[Dict] = list(enriched)
+    if all_floors:
+        for fi, fl_layout in enumerate(all_floors):
+            if fi == floor_index:
+                continue
+            bx_f = float(fl_layout.get("built_up_x", bx))
+            by_f = float(fl_layout.get("built_up_y", by))
+            bw_f = float(fl_layout.get("built_up_w", bw))
+            bh_f = float(fl_layout.get("built_up_h", bh))
+            for r in (fl_layout.get("rooms") or []):
+                cfg = _room_cfg(r)
+                dh  = str(r.get("name","")) in (parsed.get("double_height_rooms") or [])
+                wh  = cfg["h"] * (DOUBLE_HEIGHT_MULT if dh else 1.0)
+                row2: Dict[str, Any] = {
+                    **r,
+                    "__cat_resolved": _layout_room_cat(r),
+                    "__wall_h":       round(wh, 2),
+                    "__color":        cfg["color"],
+                    "__wallColor":    cfg["wallColor"],
+                    "__label":        cfg["label"],
+                    "__floor_y":      fi * FLOOR_STEP_M,
+                }
+                try:
+                    row2["__wall_openings"] = _compute_wall_openings_3d(r, bx_f, by_f, bw_f, bh_f)
+                except Exception:
+                    row2["__wall_openings"] = []
+                all_enriched.append(row2)
+
+    score_total    = (score or {}).get("total", 0)
+    score_grade    = (score or {}).get("grade", "—")
+    score_breakdown = json.dumps((score or {}).get("breakdown", {}))
+    vastu_str = f"{facing}-facing · SE Kitchen · SW Master" if vastu else f"{facing}-facing"
+
+    layout_js     = json.dumps(layout_data)
+    rooms_js      = json.dumps(enriched)
+    all_rooms_js  = json.dumps(all_enriched)
+    parsed_js     = json.dumps({
+        "bhk_type": bhk, "plot_width_ft": pw_ft, "plot_depth_ft": pd_ft,
+        "style": style, "floors": num_floors, "vastu_compliant": vastu,
+        "plot_facing": facing.lower(),
+    })
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pascal 3D — {bhk} {pw_ft}×{pd_ft}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Cormorant+Garamond:wght@300;400;600&display=swap');
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{--ink:#1a1714;--paper:#f4f0e8;--warm:#c8a96e;--muted:#8a8070;--glass:rgba(244,240,232,0.92);--panel:300px}}
+html,body{{width:100%;height:100%;overflow:hidden;background:var(--ink);font-family:'DM Mono',monospace}}
+#app{{display:flex;height:100vh;width:100vw}}
+#canvas-wrap{{flex:1;position:relative;background:radial-gradient(ellipse at 40% 30%,#2a2318,#0f0d0b)}}
+#renderer{{display:block;width:100%!important;height:100%!important}}
+#svg-wrap{{position:absolute;inset:0;display:none;overflow:auto;background:#f4f0e8}}
+#svg-wrap svg{{display:block;margin:auto;cursor:default}}
+#walkmode-overlay{{position:absolute;inset:0;display:none;pointer-events:none;z-index:5}}
+#walkmode-overlay.active{{display:flex;flex-direction:column;justify-content:center;align-items:center;pointer-events:none}}
+#crosshair{{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:20px;height:20px;pointer-events:none}}
+#crosshair::before,#crosshair::after{{content:'';position:absolute;background:rgba(200,169,110,0.8)}}
+#crosshair::before{{width:2px;height:100%;left:50%;transform:translateX(-50%)}}
+#crosshair::after{{width:100%;height:2px;top:50%;transform:translateY(-50%)}}
+#walkhud{{pointer-events:auto;position:absolute;bottom:20px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:8px;max-width:min(92vw,420px)}}
+#walkhud button{{width:40px;height:40px;border-radius:8px;background:rgba(26,23,20,0.85);border:1px solid rgba(200,169,110,0.4);color:var(--warm);font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center}}
+#walkhud .wrow{{display:flex;gap:6px}}
+#walkhint{{font-size:10px;color:rgba(244,240,232,0.75);text-align:center;line-height:1.45;letter-spacing:0.04em;padding:0 8px;text-shadow:0 1px 2px #000}}
+#walkhint kbd{{display:inline-block;padding:1px 5px;border-radius:3px;background:rgba(0,0,0,0.35);border:1px solid rgba(200,169,110,0.25);font-size:9px}}
+#panel{{width:var(--panel);background:var(--glass);backdrop-filter:blur(14px);border-left:1px solid rgba(200,169,110,0.25);display:flex;flex-direction:column;overflow:hidden}}
+#tabs{{display:flex;flex-wrap:wrap;border-bottom:1px solid rgba(200,169,110,0.25)}}
+.tab{{flex:1;min-width:40px;padding:7px 2px;text-align:center;font-size:8px;letter-spacing:.05em;text-transform:uppercase;cursor:pointer;color:var(--muted);transition:all .15s;border:none;background:none}}
+.tab.active{{color:var(--warm);border-bottom:2px solid var(--warm)}}
+#tab-content{{flex:1;overflow-y:auto;padding:14px}}
+.sl{{font-size:9px;font-weight:500;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:6px;margin-top:12px}}
+.sl:first-child{{margin-top:0}}
+.ctrl-grid{{display:grid;grid-template-columns:1fr 1fr;gap:4px}}
+.ctrl-btn{{padding:7px 5px;border-radius:4px;border:1px solid rgba(200,169,110,.3);background:transparent;font-family:'DM Mono',monospace;font-size:10px;color:var(--ink);cursor:pointer;transition:all .12s;letter-spacing:.04em}}
+.ctrl-btn:hover,.ctrl-btn.active{{background:var(--warm);color:var(--paper);border-color:var(--warm)}}
+.room-tag{{display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:4px;cursor:pointer;transition:background .12s;font-size:11px;color:var(--ink)}}
+.room-tag:hover,.room-tag.active{{background:rgba(200,169,110,.2)}}
+.sw{{width:9px;height:9px;border-radius:2px;flex-shrink:0}}
+.score-card{{background:rgba(200,169,110,.08);border:1px solid rgba(200,169,110,.2);border-radius:6px;padding:10px;margin-top:6px}}
+.score-main{{font-family:'Cormorant Garamond',serif;font-size:34px;font-weight:300;color:var(--warm);line-height:1}}
+.sbr{{display:flex;align-items:center;gap:5px;margin-top:4px}}
+.sbl{{font-size:9px;color:var(--muted);width:55px}}
+.sbt{{flex:1;height:3px;background:rgba(0,0,0,.1);border-radius:2px}}
+.sbf{{height:100%;border-radius:2px;background:var(--warm)}}
+.slider-row{{display:flex;flex-direction:column;gap:4px;margin-top:6px}}
+.slider-label{{display:flex;justify-content:space-between;font-size:10px;color:var(--muted)}}
+input[type=range]{{-webkit-appearance:none;width:100%;height:3px;background:rgba(200,169,110,.3);border-radius:2px;outline:none}}
+input[type=range]::-webkit-slider-thumb{{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:var(--warm);cursor:pointer}}
+.vbadge{{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:3px;background:rgba(34,139,34,.12);border:1px solid rgba(34,139,34,.3);font-size:10px;color:#1a5c1a}}
+.vdot{{width:6px;height:6px;border-radius:50%;background:#3a9a3a}}
+#compass{{position:absolute;bottom:20px;left:20px;width:52px;height:52px;pointer-events:none;z-index:3}}
+#tooltip{{position:absolute;padding:8px 11px;background:var(--ink);color:var(--paper);border:1px solid var(--warm);border-radius:4px;font-size:11px;pointer-events:none;display:none;z-index:100}}
+.tt-name{{font-size:13px;color:var(--warm);margin-bottom:3px}}
+.tt-row{{color:rgba(244,240,232,.6);font-size:10px}}
+#loading{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:var(--ink);z-index:200;font-family:'Cormorant Garamond',serif;font-size:18px;color:var(--warm);letter-spacing:.1em;transition:opacity .5s}}
+#sel-info{{font-size:10px;color:var(--ink);background:rgba(200,169,110,.1);border:1px solid rgba(200,169,110,.25);border-radius:4px;padding:8px;margin-top:8px;display:none}}
+.mat-swatch{{display:inline-block;width:18px;height:18px;border-radius:3px;border:1px solid rgba(0,0,0,.15);cursor:pointer;vertical-align:middle;margin:2px}}
+.mat-swatch.active{{outline:2px solid var(--warm);outline-offset:1px}}
+.meas-dot{{position:absolute;width:10px;height:10px;border-radius:50%;background:var(--warm);border:2px solid white;transform:translate(-50%,-50%);pointer-events:none;z-index:10}}
+</style>
+</head>
+<body>
+<div id="loading">Building 3D Scene…</div>
+<div id="app">
+<div id="canvas-wrap">
+  <canvas id="renderer"></canvas>
+  <div id="svg-wrap"></div>
+  <div id="walkmode-overlay">
+    <div id="crosshair"></div>
+    <div id="walkhud">
+      <div id="walkhint"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · click canvas for pointer-lock look · right-drag look · <kbd>Shift</kbd> jog · <kbd>C</kbd> crouch · <kbd>Esc</kbd> exit</div>
+      <div class="wrow"><button type="button" onclick="wMove(1,0)" title="Forward">▲</button></div>
+      <div class="wrow">
+        <button type="button" onclick="wTurn(-1)" title="Turn left">◀</button>
+        <button type="button" onclick="wMove(-1,0)" title="Back">▼</button>
+        <button type="button" onclick="wTurn(1)" title="Turn right">▶</button>
+      </div>
+      <div class="wrow"><button type="button" onclick="exitWalk()" style="font-size:11px;width:auto;padding:0 10px">✕ Exit walk</button></div>
+    </div>
+  </div>
+  <svg id="compass" viewBox="0 0 56 56" fill="none">
+    <circle cx="28" cy="28" r="26" stroke="rgba(200,169,110,0.3)" stroke-width="1"/>
+    <polygon points="28,6 31,28 28,32 25,28" fill="#c8a96e"/>
+    <polygon points="28,50 31,28 28,32 25,28" fill="rgba(200,169,110,0.3)"/>
+    <text x="28" y="4" text-anchor="middle" font-family="DM Mono" font-size="8" fill="#c8a96e">N</text>
+    <text x="28" y="55" text-anchor="middle" font-family="DM Mono" font-size="8" fill="rgba(200,169,110,0.4)">S</text>
+    <text x="3" y="31" text-anchor="middle" font-family="DM Mono" font-size="8" fill="rgba(200,169,110,0.4)">W</text>
+    <text x="53" y="31" text-anchor="middle" font-family="DM Mono" font-size="8" fill="rgba(200,169,110,0.4)">E</text>
+  </svg>
+  <div id="tooltip"><div class="tt-name" id="ttn">—</div><div class="tt-row" id="ttd">—</div><div class="tt-row" id="ttv">—</div></div>
+</div>
+
+<div id="panel">
+<div id="tabs">
+  <button class="tab active" onclick="showTab('view')">View</button>
+  <button class="tab" onclick="showTab('plan')">2D</button>
+  <button class="tab" onclick="showTab('rooms')">Rooms</button>
+  <button class="tab" onclick="showTab('score')">Score</button>
+  <button class="tab" onclick="showTab('sun')">Sun</button>
+  <button class="tab" onclick="showTab('measure')">Measure</button>
+  <button class="tab" onclick="showTab('boq')">BOQ</button>
+</div>
+<div id="tab-content">
+  <!-- VIEW TAB -->
+  <div id="tab-view">
+    <div class="sl">Camera</div>
+    <div class="ctrl-grid">
+      <button class="ctrl-btn active" id="btn-iso"      onclick="setView('iso')">Isometric</button>
+      <button class="ctrl-btn"        id="btn-top"      onclick="setView('top')">Top-Down</button>
+      <button class="ctrl-btn"        id="btn-front"    onclick="setView('front')">Front</button>
+      <button class="ctrl-btn"        id="btn-back"     onclick="setView('back')">Rear</button>
+      <button class="ctrl-btn"        id="btn-side"     onclick="setView('side')">Side</button>
+      <button class="ctrl-btn"        id="btn-exterior" onclick="setView('exterior')">Exterior</button>
+      <button class="ctrl-btn"        id="btn-explode"  onclick="setView('explode')">Exploded</button>
+      <button class="ctrl-btn"        id="btn-walk"     onclick="enterWalk()">Walkthrough</button>
+    </div>
+    <div class="sl">Lighting</div>
+    <div class="ctrl-grid">
+      <button class="ctrl-btn active" id="btn-golden" onclick="setLight('golden')">Golden Hr</button>
+      <button class="ctrl-btn"        id="btn-noon"   onclick="setLight('noon')">Noon</button>
+      <button class="ctrl-btn"        id="btn-night"  onclick="setLight('night')">Night</button>
+      <button class="ctrl-btn"        id="btn-studio" onclick="setLight('studio')">Studio</button>
+    </div>
+    <div class="sl">Wall Cutaway</div>
+    <div class="slider-row">
+      <div class="slider-label"><span>Height</span><span id="cv">100%</span></div>
+      <input type="range" id="cs" min="0" max="100" value="100" oninput="setCutaway(this.value)">
+    </div>
+    <div class="sl">Floor</div>
+    <div class="ctrl-grid" id="floor-btns"></div>
+    <div class="sl">Structural Grid</div>
+    <div class="ctrl-grid">
+      <button class="ctrl-btn active" id="btn-struct-off" onclick="toggleStructGrid(false)">Off</button>
+      <button class="ctrl-btn" id="btn-struct-on" onclick="toggleStructGrid(true)">On</button>
+    </div>
+    <div class="sl">Export</div>
+    <div class="ctrl-grid">
+      <button class="ctrl-btn" onclick="exportIFC()">IFC</button>
+      <button class="ctrl-btn" onclick="exportDXF()">DXF</button>
+    </div>
+    <button class="ctrl-btn" id="btn-share" style="width:100%;margin-top:4px" onclick="generateShareLink()">Copy Share Link</button>
+    <div class="sl">Compliance</div>
+    <div class="vbadge"><div class="vdot"></div>{vastu_str}</div>
+    <div class="sl">Materials — click room to paint</div>
+    <div id="mat-picker" style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:6px"></div>
+    <div id="sel-info"><b id="sel-name">—</b><br><span id="sel-detail" style="color:var(--muted)"></span></div>
+  </div>
+  <!-- 2D TAB -->
+  <div id="tab-plan" style="display:none">
+    <div class="sl">2D Floor Plan</div>
+    <button class="ctrl-btn" style="width:100%;margin-bottom:8px" onclick="toggle2D()">Open / Close Plan</button>
+    <div style="font-size:10px;color:var(--muted);line-height:1.6">Drag rooms and furniture to reposition. Changes reflect in 3D view.</div>
+    <div class="sl">Zoom</div>
+    <div class="ctrl-grid">
+      <button class="ctrl-btn" onclick="svgZoom(1.2)">+ Zoom In</button>
+      <button class="ctrl-btn" onclick="svgZoom(0.8)">− Zoom Out</button>
+    </div>
+  </div>
+  <!-- ROOMS TAB -->
+  <div id="tab-rooms" style="display:none">
+    <div class="sl">Rooms — click to focus</div>
+    <div id="rl"></div>
+  </div>
+  <!-- SCORE TAB -->
+  <div id="tab-score" style="display:none">
+    <div class="sl">Plan Score</div>
+    <div class="score-card">
+      <div class="score-main">{score_total}</div>
+      <div style="font-size:10px;color:var(--muted)">Grade {score_grade}</div>
+      <div id="sbars"></div>
+    </div>
+    <div class="sl">Details</div>
+    <div id="score-issues" style="font-size:10px;color:var(--muted);line-height:1.7"></div>
+  </div>
+  <!-- SUN PATH TAB -->
+  <div id="tab-sun" style="display:none">
+    <div class="sl">Date</div>
+    <div class="slider-row">
+      <div class="slider-label"><span>Day of year</span><span id="sun-day-lbl">Jun 21</span></div>
+      <input type="range" id="sun-day" min="1" max="365" value="172" oninput="updateSunPath()">
+    </div>
+    <div class="sl">Time</div>
+    <div class="slider-row">
+      <div class="slider-label"><span>Hour</span><span id="sun-hr-lbl">12:00</span></div>
+      <input type="range" id="sun-hr" min="5" max="20" value="12" step="0.25" oninput="updateSunPath()">
+    </div>
+    <div class="sl">Latitude</div>
+    <div class="slider-row">
+      <div class="slider-label"><span>°N</span><span id="sun-lat-lbl">12.9°</span></div>
+      <input type="range" id="sun-lat" min="-60" max="60" value="12.9" step="0.1" oninput="updateSunPath()">
+    </div>
+    <div class="sl">Shadow</div>
+    <div class="ctrl-grid">
+      <button class="ctrl-btn active" id="btn-shadow-on" onclick="toggleShadow(true)">On</button>
+      <button class="ctrl-btn" id="btn-shadow-off" onclick="toggleShadow(false)">Off</button>
+    </div>
+    <div id="sun-info" style="font-size:10px;color:var(--muted);margin-top:10px;line-height:1.7"></div>
+  </div>
+  <!-- MEASURE TAB -->
+  <div id="tab-measure" style="display:none">
+    <div class="sl">Measurement mode</div>
+    <div class="ctrl-grid">
+      <button class="ctrl-btn active" id="btn-meas-off" onclick="setMeasure(false)">Off</button>
+      <button class="ctrl-btn" id="btn-meas-on" onclick="setMeasure(true)">On</button>
+    </div>
+    <div style="font-size:10px;color:var(--muted);margin-top:8px;line-height:1.6">Click two points on any surface. Distance shown in metres and feet.</div>
+    <div id="meas-result" style="margin-top:12px;font-size:13px;color:var(--warm);display:none">
+      <div id="meas-m" style="font-size:18px;font-weight:500"></div>
+      <div id="meas-ft" style="font-size:11px;color:var(--muted)"></div>
+    </div>
+    <div class="sl" style="margin-top:12px">History</div>
+    <div id="meas-history" style="font-size:10px;color:var(--muted);line-height:1.9"></div>
+  </div>
+  <!-- BOQ TAB -->
+  <div id="tab-boq" style="display:none">
+    <div class="sl">Bill of Quantities</div>
+    <div id="boq-table" style="font-size:10px;color:var(--ink);line-height:1.8"></div>
+    <div class="sl" style="margin-top:10px">Totals</div>
+    <div id="boq-totals" style="font-size:11px;color:var(--ink);line-height:1.9"></div>
+    <button class="ctrl-btn" style="width:100%;margin-top:10px" onclick="exportBOQ()">Export CSV</button>
+  </div>
+</div>
+</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ── DATA ──────────────────────────────────────────────────────────────────────
+const LAYOUT   = {layout_js};
+const ROOMS    = {rooms_js};
+const ALLROOMS = {all_rooms_js};
+const PARSED   = {parsed_js};
+const SCORE    = {score_breakdown};
+const NUM_FLOORS = {num_floors};
+
+function _roomNameStr(r){{ return (r && r.name != null && r.name !== '') ? String(r.name) : 'room'; }}
+function _roomDispStr(r){{ return String((r && r.__label) || _roomNameStr(r)).replace(/_/g, ' '); }}
+function _roomIdSafe(r){{ return _roomNameStr(r).replace(/[^a-zA-Z0-9_-]/g, '_'); }}
+
+function showFatal(msg){{
+  if(typeof _failSafeHide!=='undefined'&&_failSafeHide){{ clearTimeout(_failSafeHide); _failSafeHide=0; }}
+  const l=document.getElementById('loading');
+  if(l){{
+    l.style.opacity='1';
+    l.style.display='flex';
+    l.textContent='3D render error: '+msg;
+  }}
+}}
+window.addEventListener('error', (e)=>{{
+  const m=(e && (e.message||''))||'unknown runtime error';
+  showFatal(m);
+}});
+window.addEventListener('unhandledrejection', (e)=>{{
+  const r=e && e.reason;
+  const m=(r && (r.message||String(r))) || 'unhandled promise rejection';
+  showFatal(m);
+}});
+
+let _loadHidden=false;
+function hideLoading(){{
+  if(_loadHidden)return; _loadHidden=true;
+  if(typeof _failSafeHide!=='undefined'&&_failSafeHide){{ clearTimeout(_failSafeHide); _failSafeHide=0; }}
+  const l=document.getElementById('loading');
+  if(l){{l.style.opacity='0';setTimeout(()=>{{l.style.display='none';}},400);}}
+}}
+var _failSafeHide=setTimeout(function(){{
+  const l=document.getElementById('loading');
+  if(!l||_loadHidden)return;
+  if((l.textContent||'').indexOf('Building')!==-1){{
+    l.style.opacity='1';l.style.display='flex';
+    l.textContent='3D is taking too long or failed silently. Press F12 → Console, then reload. If this persists, try Chrome or Edge.';
+  }}
+}},14000);
+
+// ── COORDINATE CONVERSION ─────────────────────────────────────────────────────
+const PX2M = 0.03048;
+const BX = LAYOUT.built_up_x, BY = LAYOUT.built_up_y;
+const BW = LAYOUT.built_up_w, BH = LAYOUT.built_up_h;
+const OX = (BX + BW/2)*PX2M, OZ = (BY + BH/2)*PX2M;
+function p2w(sx, sz) {{ return {{ x: sx*PX2M-OX, z: sz*PX2M-OZ }}; }}
+var __walkPickMeshes=[];
+
+// ── Plan front = entrance band (car porch / foyer / sit-out) → orbit yaw ─────
+function planFrontYaw(){{
+  let sx=0,sz=0,n=0;
+  ALLROOMS.forEach(r=>{{
+    if((Number(r.__floor_y)||0)>0.25)return;
+    const cat=(r.__cat_resolved||'');
+    const nm=String(r.name||'').toLowerCase();
+    const entrance=cat==='car_porch'||cat==='sit_out'||cat==='foyer'||cat==='entrance_foyer'
+      ||/(porch|parking|foyer|entrance|verandah|sit\\s*out)/.test(nm);
+    if(!entrance)return;
+    const p=p2w((Number(r.x)||0)+(Number(r.width)||0)/2,(Number(r.y)||0)+(Number(r.height)||0)/2);
+    sx+=p.x;sz+=p.z;n++;
+  }});
+  const f=String(PARSED.plot_facing||'north').toLowerCase();
+  const fb={{north:0,east:Math.PI/2,south:Math.PI,west:-Math.PI/2}};
+  if(!n)return fb[f]!==undefined?fb[f]:0;
+  return Math.atan2(-sx/n,-sz/n);
+}}
+const FRONT_YAW=planFrontYaw();
+
+// ── THREE INIT ────────────────────────────────────────────────────────────────
+const PANEL_W = 272;
+const canvasEl = document.getElementById('renderer');
+if(canvasEl){{canvasEl.tabIndex=1;canvasEl.style.outline='none';}}
+const canvasWrap = document.getElementById('canvas-wrap');
+// Detect if we're inside an iframe — if so, the full window is ours (parent controls sizing)
+const _inIframe = (() => {{ try {{ return window.self !== window.top; }} catch(e) {{ return true; }} }})();
+// getW: subtract the side panel only when running as a standalone page, not inside an iframe
+const getW=()=>Math.max(100,(canvasWrap?.offsetWidth||window.innerWidth)-(_inIframe?0:PANEL_W));
+const getH=()=>Math.max(100,canvasWrap?.offsetHeight||window.innerHeight);
+let renderer;
+try {{
+  renderer = new THREE.WebGLRenderer({{canvas:canvasEl, antialias:true, powerPreference:'high-performance'}});
+  renderer.setPixelRatio(Math.min((typeof devicePixelRatio!=='undefined'?devicePixelRatio:1),2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.1;
+  if(THREE.sRGBEncoding!==undefined)renderer.outputEncoding=THREE.sRGBEncoding;
+}} catch(e) {{
+  document.getElementById('loading').textContent='WebGL unavailable in this browser.';
+  throw e;
+}}
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1410);
+scene.fog = new THREE.FogExp2(0x1a1410, 0.012);
+const camera = new THREE.PerspectiveCamera(42, getW()/getH(), 0.1, 300);
+const walkRay=new THREE.Raycaster();
+
+// ── ORBIT ─────────────────────────────────────────────────────────────────────
+let orb={{active:false,px:0,py:0}}, orbR={{active:false,px:0,py:0}};
+let th=FRONT_YAW-0.55, ph=0.9, cr=24, ctx=0,ctz=0;
+function camUpdate(){{
+  camera.position.set(ctx+cr*Math.sin(ph)*Math.sin(th), cr*Math.cos(ph)+ctx*0, ctz+cr*Math.sin(ph)*Math.cos(th));
+  camera.lookAt(ctx,0,ctz);
+}}
+const wrap=document.getElementById('canvas-wrap');
+let walkMode=false;
+let wPos=new THREE.Vector3(0,1.62,0);
+let wAngle=0,wPitch=0,wEye=1.62;
+const WALK_MOUSE_SENS=0.00208,WALK_PITCH_MIN=-0.52,WALK_PITCH_MAX=0.58;
+const WALK_BASE=0.038,WALK_RUN=0.082;
+const wKeys={{}};
+wrap.addEventListener('mousedown',e=>{{
+  if(walkMode){{
+    if(e.button===2){{orbR={{active:true,px:e.clientX,py:e.clientY}};e.preventDefault();}}
+    if(canvasEl&&typeof canvasEl.focus==='function')try{{canvasEl.focus();}}catch(_e){{}}
+    return;
+  }}
+  if(e.button===2){{orbR={{active:true,px:e.clientX,py:e.clientY}};e.preventDefault();return;}}
+  orb={{active:true,px:e.clientX,py:e.clientY}};
+  if(canvasEl&&typeof canvasEl.focus==='function')try{{canvasEl.focus();}}catch(_e){{}}
+}});
+wrap.addEventListener('mouseup',e=>{{if(e.button===2)orbR.active=false; orb.active=false;}});
+wrap.addEventListener('mouseleave',()=>{{orb.active=false;orbR.active=false;}});
+wrap.addEventListener('contextmenu',e=>e.preventDefault());
+wrap.addEventListener('mousemove',e=>{{
+  if(walkMode&&document.pointerLockElement===wrap&&(e.movementX||e.movementY)){{
+    wAngle-=e.movementX*WALK_MOUSE_SENS;
+    wPitch=Math.max(WALK_PITCH_MIN,Math.min(WALK_PITCH_MAX,wPitch-e.movementY*WALK_MOUSE_SENS));
+    return;
+  }}
+  if(walkMode&&orbR.active&&!document.pointerLockElement){{
+    wAngle-=(e.clientX-orbR.px)*WALK_MOUSE_SENS*1.15;
+    wPitch=Math.max(WALK_PITCH_MIN,Math.min(WALK_PITCH_MAX,wPitch-(e.clientY-orbR.py)*WALK_MOUSE_SENS*1.15));
+    orbR.px=e.clientX;orbR.py=e.clientY;
+    return;
+  }}
+  if(walkMode){{walkLook(e);return;}}
+  if(orbR.active){{
+    th-=(e.clientX-orbR.px)*0.006; ph=Math.max(0.08,Math.min(1.56,ph+(e.clientY-orbR.py)*0.006));
+    orbR.px=e.clientX; orbR.py=e.clientY; camUpdate();
+  }}
+  if(orb.active){{
+    th-=(e.clientX-orb.px)*0.005; ph=Math.max(0.05,Math.min(1.56,ph+(e.clientY-orb.py)*0.005));
+    orb.px=e.clientX; orb.py=e.clientY; camUpdate();
+  }}
+  handleHover(e);
+}});
+wrap.addEventListener('wheel',e=>{{cr=Math.max(4,Math.min(80,cr+e.deltaY*0.04));camUpdate();}},{{passive:true}});
+
+// ── LIGHTS ────────────────────────────────────────────────────────────────────
+let sun,amb,fill,hemi;
+function buildLights(){{
+  scene.children.filter(c=>c.isLight).forEach(l=>scene.remove(l));
+  hemi=new THREE.HemisphereLight(0x8090c0,0x604838,0.55); scene.add(hemi);
+  amb=new THREE.AmbientLight(0xfff0d8,0.55); scene.add(amb);
+  sun=new THREE.DirectionalLight(0xffecd0,3.0);
+  sun.position.set(15,22,-10); sun.castShadow=true;
+  sun.shadow.mapSize.width=sun.shadow.mapSize.height=2048;
+  sun.shadow.camera.left=-30;sun.shadow.camera.right=30;
+  sun.shadow.camera.top=30;sun.shadow.camera.bottom=-30;
+  sun.shadow.bias=-0.0005; sun.shadow.normalBias=0.02; scene.add(sun);
+  fill=new THREE.DirectionalLight(0xc8d8ff,0.6); fill.position.set(-10,10,15); scene.add(fill);
+  // Warm bounce from ground
+  const bounce=new THREE.DirectionalLight(0xffe8c0,0.2); bounce.position.set(0,-5,0); scene.add(bounce);
+}}
+buildLights();
+
+function setLight(m){{
+  ['golden','noon','night','studio'].forEach(v=>document.getElementById('btn-'+v)?.classList.remove('active'));
+  document.getElementById('btn-'+m)?.classList.add('active');
+  scene.fog.density=(m==='night')?0.018:0.012;
+  if(m==='golden'){{
+    sun.color.set(0xffecd0);sun.intensity=3.0;sun.position.set(15,8,-10);
+    amb.color.set(0xfff0d8);amb.intensity=0.55;hemi.color.set(0xff9060);hemi.groundColor.set(0x604838);hemi.intensity=0.5;
+    renderer.toneMappingExposure=1.15;scene.fog.color.set(0x2a1810);
+  }} else if(m==='noon'){{
+    sun.color.set(0xffffff);sun.intensity=3.8;sun.position.set(0,30,0);
+    amb.color.set(0xffffff);amb.intensity=0.9;hemi.intensity=0.5;
+    renderer.toneMappingExposure=0.95;scene.fog.color.set(0x1a1410);
+  }} else if(m==='night'){{
+    sun.color.set(0x1828a0);sun.intensity=0.3;sun.position.set(-8,15,12);
+    amb.color.set(0x101828);amb.intensity=0.12;hemi.color.set(0x102040);hemi.groundColor.set(0x050810);hemi.intensity=0.2;
+    renderer.toneMappingExposure=0.4;scene.fog.color.set(0x060810);scene.fog.density=0.018;
+  }} else if(m==='studio'){{
+    sun.color.set(0xffffff);sun.intensity=2.5;sun.position.set(10,20,5);
+    amb.color.set(0xffffff);amb.intensity=1.4;hemi.intensity=0.3;
+    renderer.toneMappingExposure=0.88;scene.fog.color.set(0x1a1410);
+  }}
+}}
+
+// ── GROUND & LANDSCAPE ────────────────────────────────────────────────────────
+(function(){{
+  // Base ground — dark grass
+  const gm=new THREE.Mesh(new THREE.PlaneGeometry(160,160),new THREE.MeshLambertMaterial({{color:0x1a1e12}}));
+  gm.rotation.x=-Math.PI/2; gm.position.y=-0.02; gm.receiveShadow=true; scene.add(gm);
+  // Plot grass (brighter inside boundary)
+  const pm=new THREE.Mesh(new THREE.PlaneGeometry(LAYOUT.plot_w_px*PX2M+0.4,LAYOUT.plot_h_px*PX2M+0.4),new THREE.MeshLambertMaterial({{color:0x2e4020}}));
+  pm.rotation.x=-Math.PI/2; pm.position.y=-0.01; scene.add(pm);
+  // Driveway concrete (front strip)
+  const dw=new THREE.Mesh(new THREE.PlaneGeometry(BW*PX2M*0.5,BY*PX2M+0.5),new THREE.MeshLambertMaterial({{color:0x8a8880}}));
+  dw.rotation.x=-Math.PI/2; dw.position.set(0,0.001,-(BH*PX2M/2+BY*PX2M/2)); scene.add(dw);
+  // Driveway centre line markings
+  for(let i=0;i<3;i++){{
+    const ln=new THREE.Mesh(new THREE.PlaneGeometry(0.12,0.8),new THREE.MeshLambertMaterial({{color:0xd0ccc0}}));
+    ln.rotation.x=-Math.PI/2; ln.position.set(0,0.002,-(BH*PX2M/2)-(i+0.5)*BY*PX2M/3.5); scene.add(ln);
+  }}
+  // Boundary wall
+  const bwM=new THREE.MeshLambertMaterial({{color:0x686e58}});
+  const bwH=0.65, bwT=0.14;
+  const pw2=LAYOUT.plot_w_px*PX2M, ph2=LAYOUT.plot_h_px*PX2M;
+  [
+    [pw2,bwH,bwT, 0,bwH/2,-ph2/2],
+    [pw2,bwH,bwT, 0,bwH/2, ph2/2],
+    [bwT,bwH,ph2,-pw2/2,bwH/2,0],
+    [bwT,bwH,ph2, pw2/2,bwH/2,0],
+  ].forEach(([w,h,d,x,y,z])=>{{
+    const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),bwM);
+    m.position.set(x,y,z); m.castShadow=true; scene.add(m);
+    // Wall coping
+    const copM=new THREE.MeshLambertMaterial({{color:0x9a9880}});
+    const cop=new THREE.Mesh(new THREE.BoxGeometry(w+0.02,0.06,d+0.02),copM);
+    cop.position.set(x,bwH+0.03,z); scene.add(cop);
+  }});
+  // Gate pillars (front centre)
+  const pilM=new THREE.MeshLambertMaterial({{color:0xb8aa88}});
+  const gateW=2.8;
+  [[-gateW/2,0],[gateW/2,0]].forEach(([gx,gz])=>{{
+    const pil=new THREE.Mesh(new THREE.BoxGeometry(0.28,1.1,0.28),pilM);
+    pil.position.set(gx,0.55,-ph2/2); scene.add(pil);
+    const cap=new THREE.Mesh(new THREE.BoxGeometry(0.34,0.1,0.34),pilM);
+    cap.position.set(gx,1.15,-ph2/2); scene.add(cap);
+  }});
+  // Trees — improved with tapered trunks and layered canopy
+  const trunkM=new THREE.MeshLambertMaterial({{color:0x5a3810}});
+  const leafM =new THREE.MeshLambertMaterial({{color:0x2d5a1e}});
+  const leafM2=new THREE.MeshLambertMaterial({{color:0x3a7228}});
+  const treePositions=[
+    [-pw2/2+1.6,-ph2/2+2.5],[pw2/2-1.6,-ph2/2+2.5],
+    [-pw2/2+1.6, ph2/2-2.5],[pw2/2-1.6, ph2/2-2.5],
+    [-pw2/2+1.6, 0         ],[pw2/2-1.6, 0         ],
+  ];
+  treePositions.forEach(([tx,tz])=>{{
+    const t=new THREE.Mesh(new THREE.CylinderGeometry(0.08,0.16,2.2,7),trunkM);
+    t.position.set(tx,1.1,tz); scene.add(t);
+    // Layered canopy for fuller look
+    [[0.9,8,6,2.8],[0.7,8,5,3.5],[0.5,8,5,4.0]].forEach(([r,ws,hs,hy])=>{{
+      const l=new THREE.Mesh(new THREE.SphereGeometry(r,ws,hs),(hy>3.2?leafM2:leafM));
+      l.position.set(tx,hy,tz); l.castShadow=true; scene.add(l);
+    }});
+  }});
+  // Flower beds along front wall
+  const bedM=new THREE.MeshLambertMaterial({{color:0x8B4513}});
+  const flwM=new THREE.MeshLambertMaterial({{color:0xe05050}});
+  for(let i=-2;i<=2;i++){{
+    if(Math.abs(i)<1.5) continue; // skip gate area
+    const bed=new THREE.Mesh(new THREE.BoxGeometry(0.8,0.15,0.4),bedM);
+    bed.position.set(i*pw2/6,0.08,-ph2/2+0.35); scene.add(bed);
+    const flw=new THREE.Mesh(new THREE.SphereGeometry(0.12,6,5),flwM);
+    flw.position.set(i*pw2/6,0.28,-ph2/2+0.35); scene.add(flw);
+  }}
+  // Street lamp post at front-left corner
+  const lampM=new THREE.MeshLambertMaterial({{color:0x404040}});
+  const lampG=new THREE.MeshLambertMaterial({{color:0xffffcc,emissive:0xffff88,emissiveIntensity:0.6}});
+  const post=new THREE.Mesh(new THREE.CylinderGeometry(0.04,0.06,3.5,8),lampM);
+  post.position.set(-pw2/2-0.5,1.75,-ph2/2-0.5); scene.add(post);
+  const lamp=new THREE.Mesh(new THREE.SphereGeometry(0.18,8,6),lampG);
+  lamp.position.set(-pw2/2-0.5,3.6,-ph2/2-0.5); scene.add(lamp);
+  const lampLight=new THREE.PointLight(0xffeeaa,0.8,6);
+  lampLight.position.set(-pw2/2-0.5,3.5,-ph2/2-0.5); scene.add(lampLight);
+  __walkPickMeshes.push(gm,pm,dw);
+}})();
+
+// ── STAIRCASE GEOMETRY (plan-aligned run + nav volumes for walk mode) ────────
+function buildStaircase(room, floorY) {{
+  const pos=p2w((Number(room.x)||0)+(Number(room.width)||0)/2,(Number(room.y)||0)+(Number(room.height)||0)/2);
+  const rw=Math.max(0.15,(Number(room.width)||0)*PX2M), rd=Math.max(0.15,(Number(room.height)||0)*PX2M);
+  const runAlongZ=rd>=rw;
+  const runLen=(runAlongZ?rd:rw)*0.9;
+  const treadW=(runAlongZ?rw:rd)*0.86;
+  const nSteps=Math.max(10,Math.min(22,Math.round(runLen/0.255)));
+  const stepH=FLOOR_STEP_M/nSteps;
+  const stepRun=runLen/nSteps;
+  const stepM=new THREE.MeshLambertMaterial({{color:0xd8cfc4}});
+  const riserM=new THREE.MeshLambertMaterial({{color:0xc8beb4}});
+  const stringerM=new THREE.MeshLambertMaterial({{color:0x5a4030}});
+  const railM=new THREE.MeshLambertMaterial({{color:0x8B6032}});
+  const g=new THREE.Group();
+  room.__stairNav=[];
+  const pitch=Math.atan2(FLOOR_STEP_M,runLen);
+  const strLen=Math.hypot(FLOOR_STEP_M,runLen)*1.02;
+  if(runAlongZ){{
+    const sxL=pos.x-treadW/2-0.06,sxR=pos.x+treadW/2+0.06;
+    const zs0=pos.z-runLen/2,zs1=pos.z+runLen/2;
+    const strL=new THREE.Mesh(new THREE.BoxGeometry(0.1,strLen*0.5,runLen),stringerM);
+    strL.position.set(sxL,floorY+FLOOR_STEP_M*0.25,(zs0+zs1)/2);
+    strL.rotation.x=-pitch; strL.castShadow=true; g.add(strL);
+    const strR=strL.clone(); strR.position.x=sxR; g.add(strR);
+  }} else {{
+    const szN=pos.z-treadW/2-0.06,szS=pos.z+treadW/2+0.06;
+    const xs0=pos.x-runLen/2,xs1=pos.x+runLen/2;
+    const strN=new THREE.Mesh(new THREE.BoxGeometry(runLen,strLen*0.5,0.1),stringerM);
+    strN.position.set((xs0+xs1)/2,floorY+FLOOR_STEP_M*0.25,szN);
+    strN.rotation.z=pitch; strN.castShadow=true; g.add(strN);
+    const strS=strN.clone(); strS.position.z=szS; g.add(strS);
+  }}
+  for(let i=0;i<nSteps;i++){{
+    const ty=floorY+(i+0.5)*stepH;
+    let px=pos.x,pz=pos.z;
+    if(runAlongZ){{ pz=pos.z-runLen/2+(i+0.5)*stepRun; }}
+    else {{ px=pos.x-runLen/2+(i+0.5)*stepRun; }}
+    const tread=new THREE.Mesh(new THREE.BoxGeometry(
+      runAlongZ?treadW:stepRun*0.96, stepH*0.92, runAlongZ?stepRun*0.96:treadW
+    ),stepM);
+    tread.position.set(px,ty,pz); tread.receiveShadow=true; tread.castShadow=true; g.add(tread);
+    const risH=stepH*0.95;
+    const ris=new THREE.Mesh(new THREE.BoxGeometry(
+      runAlongZ?stepRun*0.96:Math.min(treadW,stepRun)*0.98, risH, runAlongZ?Math.min(treadW,stepRun)*0.98:stepRun*0.96
+    ),riserM);
+    if(runAlongZ){{ ris.position.set(px,ty+stepH*0.45,pz-stepRun*0.48); }}
+    else {{ ris.position.set(px-stepRun*0.48,ty+stepH*0.45,pz); }}
+    ris.castShadow=true; g.add(ris);
+    let minX,maxX,minZ,maxZ;
+    if(runAlongZ){{
+      minX=pos.x-treadW/2; maxX=pos.x+treadW/2; minZ=pz-stepRun*0.55; maxZ=pz+stepRun*0.55;
+    }} else {{
+      minX=px-stepRun*0.55; maxX=px+stepRun*0.55; minZ=pos.z-treadW/2; maxZ=pos.z+treadW/2;
+    }}
+    room.__stairNav.push({{minX,maxX,minZ,maxZ,y0:floorY+i*stepH,y1:floorY+(i+1)*stepH+0.08}});
+  }}
+  const railH=Math.min(0.92,FLOOR_STEP_M*0.88);
+  const postGeo=new THREE.CylinderGeometry(0.035,0.04,railH,8);
+  const railTop=new THREE.MeshLambertMaterial({{color:0xa07048}});
+  if(runAlongZ){{
+    const z0=pos.z-runLen/2,z1=pos.z+runLen/2;
+    [[pos.x-treadW/2-0.04,z0],[pos.x+treadW/2+0.04,z0],[pos.x-treadW/2-0.04,z1],[pos.x+treadW/2+0.04,z1]].forEach(([rx,rz])=>{{
+      const post=new THREE.Mesh(postGeo,railM); post.position.set(rx,floorY+railH/2,rz); g.add(post);
+    }});
+    const top=new THREE.Mesh(new THREE.BoxGeometry(treadW+0.16,0.05,runLen+0.08),railTop);
+    top.position.set(pos.x,floorY+railH, pos.z); g.add(top);
+  }} else {{
+    const x0=pos.x-runLen/2,x1=pos.x+runLen/2;
+    [[x0,pos.z-treadW/2-0.04],[x1,pos.z-treadW/2-0.04],[x0,pos.z+treadW/2+0.04],[x1,pos.z+treadW/2+0.04]].forEach(([rx,rz])=>{{
+      const post=new THREE.Mesh(postGeo,railM); post.position.set(rx,floorY+railH/2,rz); g.add(post);
+    }});
+    const top=new THREE.Mesh(new THREE.BoxGeometry(runLen+0.08,0.05,treadW+0.16),railTop);
+    top.position.set(pos.x,floorY+railH, pos.z); g.add(top);
+  }}
+  scene.add(g);
+  return g;
+}}
+
+// ── WALL + OPENING BUILDER ────────────────────────────────────────────────────
+const EXT_WALL_T=0.23, INT_WALL_T=0.115;
+const DOOR_W=0.9, DOOR_H=2.1, WIN_W=1.2, WIN_H=1.1, WIN_SILL=0.9;
+const FLOOR_STEP_M={FLOOR_STEP_M};
+
+function makeWallWithOpenings(len,wh,thk,openings){{
+  len=Math.max(0.05,Number(len)||0.05);wh=Math.max(0.05,Number(wh)||0.05);thk=Math.max(0.01,Number(thk)||0.01);
+  const sh=new THREE.Shape();
+  sh.moveTo(0,0);sh.lineTo(len,0);sh.lineTo(len,wh);sh.lineTo(0,wh);sh.closePath();
+  openings.forEach(op=>{{
+    const cx=op.pos*len,hw=op.w/2;
+    const x0=Math.max(0.05,cx-hw),x1=Math.min(len-0.05,cx+hw);
+    const y0=op.sillY||0,y1=Math.min(y0+op.h,wh-0.05);
+    if(x1-x0<0.1||y1-y0<0.1)return;
+    const hole=new THREE.Path();
+    hole.moveTo(x0,y0);hole.lineTo(x1,y0);hole.lineTo(x1,y1);hole.lineTo(x0,y1);hole.closePath();
+    sh.holes.push(hole);
+  }});
+  return new THREE.ExtrudeGeometry(sh,{{depth:thk,bevelEnabled:false}});
+}}
+
+function makeDoor(w,h){{
+  const g=new THREE.Group();
+  const fM=new THREE.MeshLambertMaterial({{color:0x6b4f2a}});
+  const pM=new THREE.MeshLambertMaterial({{color:0x8b6332,side:THREE.DoubleSide}});
+  [[w,0.05,0.05,0,h-0.025,0],[w,0.05,0.05,0,0.025,0],
+   [0.05,h,0.05,-w/2+0.025,h/2,0],[0.05,h,0.05,w/2-0.025,h/2,0]
+  ].forEach(([fw,fh,fd,fx,fy])=>{{const m=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,fd),fM);m.position.set(fx,fy,0);g.add(m);}});
+  const panel=new THREE.Mesh(new THREE.BoxGeometry(w-0.1,h-0.05,0.04),pM);
+  panel.position.set(0,(h-0.05)/2,0.02);g.add(panel);
+  const hM=new THREE.MeshLambertMaterial({{color:0xc8a040}});
+  const handle=new THREE.Mesh(new THREE.CylinderGeometry(0.02,0.02,0.12,8),hM);
+  handle.rotation.z=Math.PI/2;handle.position.set(w*0.35,h*0.45,0.07);g.add(handle);
+  return g;
+}}
+
+function makeWindow(w,h){{
+  const g=new THREE.Group();
+  const fM=new THREE.MeshLambertMaterial({{color:0xd4c9b0}});
+  const gM=new THREE.MeshLambertMaterial({{color:0xa8d0e8,transparent:true,opacity:0.4,side:THREE.DoubleSide}});
+  const ft=0.04;
+  [[w,ft,ft,0,h-ft/2,0],[w,ft,ft,0,ft/2,0],
+   [ft,h,ft,-w/2+ft/2,h/2,0],[ft,h,ft,w/2-ft/2,h/2,0]
+  ].forEach(([fw,fh,fd,fx,fy])=>{{const m=new THREE.Mesh(new THREE.BoxGeometry(fw,fh,fd),fM);m.position.set(fx,fy,0);g.add(m);}});
+  const mid=new THREE.Mesh(new THREE.BoxGeometry(w,ft,ft),fM);mid.position.set(0,h/2,0);g.add(mid);
+  [[0,h*0.25],[0,h*0.75]].forEach(([gx,gy])=>{{
+    const gl=new THREE.Mesh(new THREE.PlaneGeometry(w-ft*3,h/2-ft*2),gM);
+    gl.position.set(gx,gy,0.01);g.add(gl);
+  }});
+  return g;
+}}
+
+// ── FURNITURE BUILDER ─────────────────────────────────────────────────────────
+const MATS={{
+  wood:new THREE.MeshLambertMaterial({{color:0x8B6F47}}),
+  darkWood:new THREE.MeshLambertMaterial({{color:0x5a3a1a}}),
+  cush:new THREE.MeshLambertMaterial({{color:0xd4c4a0}}),
+  bed:new THREE.MeshLambertMaterial({{color:0xeeeadf}}),
+  wht:new THREE.MeshLambertMaterial({{color:0xf5f2ee}}),
+  metal:new THREE.MeshLambertMaterial({{color:0x888890}}),
+  glass:new THREE.MeshLambertMaterial({{color:0x88aacc,transparent:true,opacity:0.4}}),
+  darkPanel:new THREE.MeshLambertMaterial({{color:0x222230}}),
+  carBody:new THREE.MeshLambertMaterial({{color:0x3a4a5a}}),
+  carGlass:new THREE.MeshLambertMaterial({{color:0x6888aa,transparent:true,opacity:0.5}}),
+}};
+function box(w,h,d,mat,x,y,z,parent){{
+  const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat);
+  m.position.set(x,y,z);m.castShadow=true;
+  if(parent)parent.add(m);else scene.add(m);
+  return m;
+}}
+function cyl(r,h,mat,x,y,z,parent,segs=8){{
+  const m=new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,segs),mat);
+  m.position.set(x,y,z);m.castShadow=true;
+  if(parent)parent.add(m);else scene.add(m);
+  return m;
+}}
+
+function addFurniture3D(room, floorY){{
+  const pos=p2w(room.x+room.width/2,room.y+room.height/2);
+  const rw=room.width*PX2M, rd=room.height*PX2M;
+  const wh=room.__wall_h||2.7;
+  const cat=room.__cat_resolved||'default';
+  const px=pos.x, pz=pos.z, py=floorY+0.08;
+
+  if(cat==='living_room'){{
+    // L-sofa
+    box(rw*.5,.38,.7,MATS.cush,px-rw*.08,py+.19,pz+rd*.18);
+    box(.7,.38,rd*.28,MATS.cush,px+rw*.14,py+.19,pz+rd*.04);
+    box(rw*.48,.08,.08,MATS.darkWood,px-rw*.08,py+.57,pz-rd*.25);
+    // coffee table
+    box(.85,.07,.5,MATS.wood,px-rw*.08,py+.4,pz-rd*.1);
+    // TV unit
+    box(rw*.5,.06,.28,MATS.darkWood,px-rw*.06,py+.5,pz-rd*.38);
+    box(rw*.4,.38,.04,MATS.darkPanel,px-rw*.06,py+.28,pz-rd*.39);
+  }} else if(cat==='master_bedroom'||cat==='bedroom'||cat==='parents_bedroom'||cat==='guest_bedroom'){{
+    const s=cat==='master_bedroom'?1.0:0.82;
+    // Bed frame
+    box(rw*.52*s,.06,rd*.52*s,MATS.wood,px,py+.06,pz+rd*.1);
+    // Mattress
+    box(rw*.48*s,.18,rd*.48*s,MATS.bed,px,py+.18,pz+rd*.1);
+    // Headboard
+    box(rw*.52*s,.52,.08,MATS.darkWood,px,py+.3,pz-rd*.15);
+    // Pillows
+    [[-rw*.1],[rw*.1]].forEach(([dx])=>box(rw*.2,.08,rd*.14,MATS.wht,px+dx,py+.32,pz-rd*.08));
+    // Wardrobe
+    box(rw*.3,.04,rd*.5,MATS.wood,px+rw*.32,py+.02,pz-rd*.05);
+    box(rw*.3,2.0,.5,MATS.darkWood,px+rw*.32,py+1,pz-rd*.05);
+    // Nightstand
+    box(.35,.55,.35,MATS.wood,px-rw*.26,py+.28,pz-rd*.1);
+  }} else if(cat==='kitchen'||cat==='wet_kitchen'||cat==='dry_kitchen'){{
+    // Counter L-shape
+    box(rw*.65,.88,.5,MATS.wht,px+rw*.08,py+.44,pz-rd*.35);
+    box(.5,.88,rd*.5,MATS.wht,px-rw*.35,py+.44,pz+rd*.05);
+    box(rw*.65,.04,.5,MATS.metal,px+rw*.08,py+.89,pz-rd*.35);
+    box(.5,.04,rd*.5,MATS.metal,px-rw*.35,py+.89,pz+rd*.05);
+    // Hob
+    [-.06,.06].forEach(dx=>[-.03,.03].forEach(dz=>{{
+      cyl(.07,.02,new THREE.MeshLambertMaterial({{color:0x333333}}),px+rw*.08+dx,py+.92,pz-rd*.35+dz,null,12);
+    }}));
+    // Sink
+    box(.42,.1,.35,new THREE.MeshLambertMaterial({{color:0xaaaaaa}}),px+rw*.28,py+.85,pz-rd*.35);
+    // Upper cabinets
+    box(rw*.65,.6,.3,MATS.wht,px+rw*.08,py+1.9,pz-rd*.35);
+    // Fridge
+    box(.6,1.8,.6,MATS.wht,px-rw*.38,py+.9,pz-rd*.35);
+    box(.55,1.0,.02,MATS.glass,px-rw*.38,py+1.42,pz-rd*.32);
+  }} else if(cat==='dining_room'){{
+    box(rw*.58,.07,rd*.42,MATS.wood,px,py+.74,pz);
+    [[-1,-1],[-1,1],[1,-1],[1,1]].forEach(([dx,dz])=>{{
+      box(.35,.7,.35,MATS.wood,px+rw*.12*dx,py+.35,pz+rd*.13*dz);
+      box(.38,.04,.38,MATS.cush,px+rw*.12*dx,py+.71,pz+rd*.13*dz);
+    }});
+    cyl(.03,.65,MATS.metal,px,py+.37,pz,null,4);
+  }} else if(cat==='bathroom'||cat==='common_bathroom'||cat==='guest_powder_room'){{
+    // Safe usable dimensions after stripping wall thickness on all four sides
+    const sw=Math.max(rw-2*EXT_WALL_T-0.1, 0.35);
+    const sd=Math.max(rd-2*EXT_WALL_T-0.1, 0.35);
+    // WC — back-left corner
+    box(Math.min(.35,sw*.38),.3,Math.min(.44,sd*.38),MATS.wht,px-sw*.22,py+.15,pz+sd*.22);
+    box(Math.min(.42,sw*.42),.07,Math.min(.35,sd*.32),MATS.wht,px-sw*.22,py+.34,pz+sd*.18);
+    cyl(Math.min(.17,sw*.18),.32,MATS.wht,px-sw*.22,py+.16,pz+sd*.25,null,12);
+    // Basin — front-right
+    box(Math.min(.44,sw*.4),.07,Math.min(.34,sd*.28),MATS.wht,px+sw*.18,py+.75,pz-sd*.22);
+    box(Math.min(.42,sw*.38),.7,Math.min(.32,sd*.26),MATS.wht,px+sw*.18,py+.35,pz-sd*.22);
+    // Shower tray — right-centre only if room is wide enough
+    if(sw>0.9&&sd>0.9){{
+      box(Math.min(.85,sw*.55),.04,Math.min(.85,sd*.55),new THREE.MeshLambertMaterial({{color:0xd0e0e8}}),px+sw*.18,py+.02,pz+sd*.2);
+    }}
+    // Mirror above basin
+    box(Math.min(.38,sw*.32),.6,.02,MATS.glass,px+sw*.18,py+1.1,pz-sd*.32);
+  }} else if(cat==='car_porch'){{
+    // Car body
+    const cg=new THREE.Group();
+    box(1.8,.6,3.8,MATS.carBody,0,.3,0,cg);
+    box(1.6,.45,2.0,MATS.carBody,0,.85,-.3,cg);
+    // Windows
+    box(1.55,.35,1.8,MATS.carGlass,0,.86,-.3,cg);
+    // Wheels
+    [[-1,-1],[-1,1],[1,-1],[1,1]].forEach(([dx,dz])=>{{
+      cyl(.3,.2,new THREE.MeshLambertMaterial({{color:0x222222}}),dx*.76,.22,dz*1.3,cg,12);
+      cyl(.18,.22,new THREE.MeshLambertMaterial({{color:0x888888}}),dx*.76,.22,dz*1.3,cg,12);
+    }});
+    cg.position.set(pos.x,floorY,pos.z); cg.castShadow=true; scene.add(cg);
+    return;
+  }} else if(cat==='home_office'){{
+    box(rw*.7,.04,rd*.38,MATS.wood,px-rw*.06,py+.76,pz-rd*.28);
+    box(rw*.7,.72,.5,MATS.wht,px-rw*.06,py+.36,pz-rd*.28);
+    box(rw*.45,.38,.04,MATS.darkPanel,px-rw*.06,py+.6,pz-rd*.29);
+    // Chair
+    box(.42,.04,.42,MATS.cush,px-rw*.06,py+.48,pz+rd*.05);
+    cyl(.04,.48,MATS.metal,px-rw*.06,py+.24,pz+rd*.05);
+    // Bookshelf
+    box(rw*.32,1.6,.3,MATS.wood,px+rw*.32,py+.8,pz-rd*.28);
+    [.4,.75,1.1,1.4].forEach(hy=>box(rw*.3,.02,.28,MATS.darkWood,px+rw*.32,py+hy,pz-rd*.28));
+  }} else if(cat==='staircase'){{
+    buildStaircase(room, floorY);
+    return;
+  }} else if(cat==='family_lounge'){{
+    box(rw*.62,.38,.6,MATS.cush,px-rw*.08,py+.19,pz-rd*.15);
+    box(rw*.62,.04,.6,MATS.darkWood,px-rw*.08,py+.59,pz-rd*.15);
+    box(.55,.38,rd*.35,MATS.cush,px+rw*.2,py+.19,pz+rd*.05);
+    box(.52,.07,.42,MATS.wood,px-rw*.05,py+.4,pz+rd*.2);
+    box(rw*.4,.35,.04,MATS.darkPanel,px-rw*.08,py+.28,pz-rd*.42);
+  }} else if(cat==='pooja_room'){{
+    // Altar platform
+    box(Math.min(rw*.7,.9),.12,Math.min(rd*.4,.5),MATS.wood,px,py+.06,pz+rd*.1);
+    // Idol stand
+    box(Math.min(rw*.3,.35),.6,.08,new THREE.MeshLambertMaterial({{color:0xd4a840}}),px,py+.42,pz+rd*.08);
+    // Diya lamp
+    cyl(.06,.04,new THREE.MeshLambertMaterial({{color:0xcc8820}}),px-rw*.12,py+.2,pz+rd*.1,null,10);
+    cyl(.06,.04,new THREE.MeshLambertMaterial({{color:0xcc8820}}),px+rw*.12,py+.2,pz+rd*.1,null,10);
+    // Bell hanging — thin rod + bell shape
+    box(.02,.5,.02,MATS.metal,px,py+wh*.7,pz-rd*.3);
+    cyl(.07,.08,new THREE.MeshLambertMaterial({{color:0xd4a840}}),px,py+wh*.45,pz-rd*.3,null,12);
+  }} else if(cat==='walk_in_wardrobe'){{
+    // Full-height wardrobe units on three sides
+    const uH=Math.min(wh*.85,2.1);
+    box(rw*.85,.04,Math.min(rd*.35,.5),MATS.darkWood,px,py+uH,pz-rd*.3); // top shelf N
+    box(rw*.85,uH,.5,MATS.wht,px,py+uH/2,pz-rd*.3); // unit N
+    box(Math.min(rw*.35,.5),.04,rd*.7,MATS.darkWood,px+rw*.32,py+uH,pz); // top shelf E
+    box(Math.min(rw*.35,.5),uH,.5,MATS.wht,px+rw*.32,py+uH/2,pz); // unit E — rotated
+    // Hanging rail
+    box(rw*.7,.03,.03,MATS.metal,px-rw*.05,py+uH*.75,pz-rd*.22);
+    // Centre island
+    if(rw>1.8&&rd>2.0) box(rw*.35,.85,rd*.35,MATS.wood,px,py+.43,pz+rd*.15);
+  }} else if(cat==='utility_room'){{
+    // Washing machine
+    box(.58,.62,.56,MATS.wht,px-rw*.22,py+.31,pz-rd*.22);
+    cyl(.18,.04,MATS.glass,px-rw*.22,py+.62,pz-rd*.22,null,16);
+    // Dryer
+    box(.58,.62,.56,MATS.wht,px+rw*.1,py+.31,pz-rd*.22);
+    // Sink / laundry tub
+    box(.5,.82,.44,MATS.wht,px-rw*.2,py+.41,pz+rd*.22);
+    box(.46,.06,.40,new THREE.MeshLambertMaterial({{color:0xaaaaaa}}),px-rw*.2,py+.85,pz+rd*.22);
+    // Overhead cabinets
+    box(rw*.7,.55,.3,MATS.wht,px,py+1.9,pz-rd*.28);
+  }} else if(cat==='store_room'){{
+    // Shelving units
+    const sH=Math.min(wh*.85,2.0);
+    box(rw*.8,sH,.35,MATS.wood,px-rw*.05,py+sH/2,pz-rd*.35);
+    [.4,.8,1.2,1.6].filter(h=>h<sH).forEach(h=>box(rw*.78,.025,.33,MATS.darkWood,px-rw*.05,py+h,pz-rd*.35));
+    box(rw*.5,sH*.6,.35,MATS.wood,px+rw*.22,py+sH*.3,pz+rd*.2);
+  }} else if(cat==='foyer'){{
+    // Entrance console table
+    box(Math.min(rw*.55,.9),.82,.32,MATS.darkWood,px,py+.41,pz-rd*.25);
+    // Shoe rack below
+    box(Math.min(rw*.5,.8),.4,.28,MATS.wood,px,py+.2,pz-rd*.24);
+    // Mirror above console
+    box(Math.min(rw*.4,.7),.9,.02,MATS.glass,px,py+1.2,pz-rd*.32);
+    // Umbrella stand
+    cyl(.1,.6,MATS.darkWood,px+rw*.3,py+.3,pz-rd*.25,null,8);
+  }} else if(cat==='corridor'){{
+    // Wall-mounted light fixtures (decorative boxes approximating sconces)
+    [-rd*.25,rd*.25].forEach(dz=>{{
+      box(.04,.18,.12,new THREE.MeshLambertMaterial({{color:0xd4c89a}}),px-rw*.44,py+wh*.6,pz+dz);
+      box(.04,.18,.12,new THREE.MeshLambertMaterial({{color:0xd4c89a}}),px+rw*.44,py+wh*.6,pz+dz);
+    }});
+  }} else if(cat==='balcony'||cat==='sit_out'||cat==='terrace'){{
+    // Railing posts + top rail
+    const postM=new THREE.MeshLambertMaterial({{color:0x888880}});
+    const railM2=new THREE.MeshLambertMaterial({{color:0xb0a890}});
+    const railH=0.95;
+    // Posts along perimeter
+    for(let i=0;i<=4;i++){{
+      const t=i/4;
+      cyl(.025,railH,postM,px-rw/2+rw*t,py+railH/2,pz+rd/2-0.08,null,6);
+      cyl(.025,railH,postM,px-rw/2+rw*t,py+railH/2,pz-rd/2+0.08,null,6);
+    }}
+    box(rw,.03,.03,railM2,px,py+railH,pz+rd/2-0.08);
+    box(rw,.03,.03,railM2,px,py+railH,pz-rd/2+0.08);
+    // Outdoor chair pair if large enough
+    if(rw>1.5&&rd>1.5){{
+      box(.5,.04,.5,MATS.wood,px-rw*.15,py+.42,pz);
+      box(.5,.04,.5,MATS.wood,px+rw*.15,py+.42,pz);
+      [[-rw*.15],[rw*.15]].forEach(([dx])=>{{
+        box(.46,.36,.04,MATS.wood,px+dx,py+.28,pz-.22);
+        cyl(.02,.38,MATS.darkWood,px+dx-rw*.09,py+.19,pz-.18,null,4);
+        cyl(.02,.38,MATS.darkWood,px+dx+rw*.09,py+.19,pz-.18,null,4);
+      }});
+    }}
+  }} else if(cat==='servant_quarters'){{
+    // Single bed
+    box(rw*.48,.06,rd*.55,MATS.wood,px,py+.06,pz+rd*.1);
+    box(rw*.44,.14,rd*.51,MATS.bed,px,py+.17,pz+rd*.1);
+    box(rw*.48,.4,.06,MATS.darkWood,px,py+.26,pz-rd*.18);
+    // Small wardrobe
+    box(rw*.3,1.8,.4,MATS.wht,px+rw*.3,py+.9,pz-rd*.22);
+  }}
+}}
+
+// ── ROOF BUILDER ──────────────────────────────────────────────────────────────
+function buildRoof(topY){{
+  const rw=BW*PX2M, rd=BH*PX2M;
+  // Minimum 1.2m ridge so flat-plot plans get a real roof shape
+  const ridgeH=Math.max(1.2, Math.min(rw,rd)*0.20);
+  const hw=rw/2, hd=rd/2, hy=topY;
+  // 4-slope hip roof panels
+  function triRoof(pts, col){{
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute(pts.flat(),3));
+    geo.computeVertexNormals();
+    const m=new THREE.Mesh(geo,new THREE.MeshLambertMaterial({{color:col,side:THREE.DoubleSide}}));
+    m.castShadow=true; scene.add(m);
+  }}
+  triRoof([[-hw,hy,-hd],[hw,hy,-hd],[0,hy+ridgeH,0]],0x7a3d1a);
+  triRoof([[-hw,hy, hd],[hw,hy, hd],[0,hy+ridgeH,0]],0x6b3214);
+  triRoof([[-hw,hy,-hd],[-hw,hy,hd],[0,hy+ridgeH,0]],0x723618);
+  triRoof([[ hw,hy,-hd],[ hw,hy,hd],[0,hy+ridgeH,0]],0x723618);
+  // Ridge cap
+  const ridgeM=new THREE.MeshLambertMaterial({{color:0x9B5523}});
+  const ridgeBox=new THREE.Mesh(new THREE.BoxGeometry(0.24,0.18,rd*0.58),ridgeM);
+  ridgeBox.position.set(0,hy+ridgeH,0); scene.add(ridgeBox);
+  // Eave fascia boards
+  const eavM=new THREE.MeshLambertMaterial({{color:0xd8ccaa}});
+  const eavOv=0.35;
+  [
+    [rw+eavOv*2,0.14,0.18, 0,hy-0.05,-hd-eavOv/2],
+    [rw+eavOv*2,0.14,0.18, 0,hy-0.05, hd+eavOv/2],
+    [0.18,0.14,rd+eavOv*2,-hw-eavOv/2,hy-0.05,0],
+    [0.18,0.14,rd+eavOv*2, hw+eavOv/2,hy-0.05,0],
+  ].forEach(([w,h,d,x,y,z])=>{{
+    const e=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),eavM);
+    e.position.set(x,y,z); scene.add(e);
+  }});
+  // Roof tile texture lines (approximated with thin boxes)
+  const tileM=new THREE.MeshLambertMaterial({{color:0x8B4513,transparent:true,opacity:0.5}});
+  for(let i=-3;i<=3;i++){{
+    const tile=new THREE.Mesh(new THREE.BoxGeometry(0.06,0.04,rd*0.6),tileM);
+    tile.position.set(i*rw/8,hy+0.02,0); scene.add(tile);
+  }}
+  // Water tank on roof
+  const tankM=new THREE.MeshLambertMaterial({{color:0x2244aa}});
+  const tank=new THREE.Mesh(new THREE.CylinderGeometry(0.45,0.45,1.0,10),tankM);
+  tank.position.set(hw*0.5,hy+ridgeH*0.5+0.5,hd*0.4); scene.add(tank);
+  // Solar panels (if modern style)
+  const solarM=new THREE.MeshLambertMaterial({{color:0x1a2a3a,emissive:0x080c10}});
+  for(let i=0;i<3;i++){{
+    const panel=new THREE.Mesh(new THREE.BoxGeometry(0.9,0.04,0.55),solarM);
+    panel.position.set(-hw*0.3+i*1.0,hy+0.12,-hd*0.3);
+    panel.rotation.x=-0.25; scene.add(panel);
+    // Panel frame
+    const fM=new THREE.MeshLambertMaterial({{color:0x888888}});
+    const fr=new THREE.Mesh(new THREE.BoxGeometry(0.94,0.03,0.59),fM);
+    fr.position.copy(panel.position); fr.rotation.x=panel.rotation.x; scene.add(fr);
+  }}
+}}
+
+// ── EXTERIOR FACADE ───────────────────────────────────────────────────────────
+function buildExterior(totalH){{
+  const rw=BW*PX2M+0.46, rd=BH*PX2M+0.46;
+  const plinthM=new THREE.MeshLambertMaterial({{color:0x5c564c}});
+  const plinth=new THREE.Mesh(new THREE.BoxGeometry(rw+0.55,0.42,rd+0.55),plinthM);
+  plinth.position.set(0,0.2,0); plinth.receiveShadow=true; plinth.castShadow=true; scene.add(plinth);
+  const pathM=new THREE.MeshLambertMaterial({{color:0x9a958c}});
+  const rMid=Math.hypot(rw,rd)*0.48;
+  const pathRing=new THREE.Mesh(new THREE.RingGeometry(rMid+0.25,Math.max(rMid+1.1,rMid*1.35),48),pathM);
+  pathRing.rotation.x=-Math.PI/2; pathRing.position.set(0,0.008,0); pathRing.receiveShadow=true; scene.add(pathRing);
+  const moldingM=new THREE.MeshLambertMaterial({{color:0xd8d0c0}});
+  const accentM =new THREE.MeshLambertMaterial({{color:0xb89060}});
+  // Facade plaster bands per floor
+  for(let f=0;f<NUM_FLOORS;f++){{
+    const fy=f*FLOOR_STEP_M;
+    // Window lintel band
+    [[rw,0.1,0.12,0,fy+WIN_SILL+WIN_H,-rd/2-0.05],
+     [rw,0.1,0.12,0,fy+WIN_SILL+WIN_H, rd/2+0.05],
+     [0.12,0.1,rd,-rw/2-0.05,fy+WIN_SILL+WIN_H,0],
+     [0.12,0.1,rd, rw/2+0.05,fy+WIN_SILL+WIN_H,0],
+    // Floor band
+     [rw,0.09,0.1,0,fy,-rd/2-0.05],
+     [rw,0.09,0.1,0,fy, rd/2+0.05],
+     [0.1,0.09,rd,-rw/2-0.05,fy,0],
+     [0.1,0.09,rd, rw/2+0.05,fy,0],
+    ].forEach(([w,h,d,x,y,z])=>{{
+      const mk=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),y>fy+0.2?moldingM:accentM);
+      mk.position.set(x,y,z); scene.add(mk);
+    }});
+    // AC outdoor units on side walls
+    if(f>0||NUM_FLOORS>1){{
+      const acM=new THREE.MeshLambertMaterial({{color:0xd8d8d8}});
+      const acG=new THREE.MeshLambertMaterial({{color:0xaaaaaa}});
+      const ac=new THREE.Mesh(new THREE.BoxGeometry(0.7,0.5,0.3),acM);
+      ac.position.set(rw/2+0.15,fy+1.2,-rd/4); scene.add(ac);
+      const acFan=new THREE.Mesh(new THREE.CylinderGeometry(0.18,0.18,0.04,8),acG);
+      acFan.rotation.z=Math.PI/2;acFan.position.set(rw/2+0.3,fy+1.2,-rd/4); scene.add(acFan);
+    }}
+  }}
+  // Top cornice
+  [
+    [rw+0.12,0.22,0.16,0,totalH+0.05,-rd/2-0.07],
+    [rw+0.12,0.22,0.16,0,totalH+0.05, rd/2+0.07],
+    [0.16,0.22,rd+0.12,-rw/2-0.07,totalH+0.05,0],
+    [0.16,0.22,rd+0.12, rw/2+0.07,totalH+0.05,0],
+  ].forEach(([w,h,d,x,y,z])=>{{
+    const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),moldingM);
+    m.position.set(x,y,z); scene.add(m);
+  }});
+  // Main entrance portico
+  const porW=2.6, porH=totalH*0.42;
+  const colM=new THREE.MeshLambertMaterial({{color:0xd4c8a0}});
+  // Portico beam
+  const pBeam=new THREE.Mesh(new THREE.BoxGeometry(porW+0.3,0.18,0.28),moldingM);
+  pBeam.position.set(0,porH,-rd/2-0.14); scene.add(pBeam);
+  // Columns
+  [[-porW/2+0.1, porW/2-0.1]].flat().forEach(cx=>{{
+    const col=new THREE.Mesh(new THREE.CylinderGeometry(0.08,0.1,porH,10),colM);
+    col.position.set(cx,porH/2,-rd/2-0.14); scene.add(col);
+    // Column base
+    const base=new THREE.Mesh(new THREE.BoxGeometry(0.22,0.08,0.22),colM);
+    base.position.set(cx,0.04,-rd/2-0.14); scene.add(base);
+    // Column capital
+    const cap=new THREE.Mesh(new THREE.BoxGeometry(0.22,0.08,0.22),colM);
+    cap.position.set(cx,porH-0.04,-rd/2-0.14); scene.add(cap);
+  }});
+  // Entrance steps (3 risers)
+  [0,1,2].forEach(i=>{{
+    const sw=1.6-i*0.15, sd=0.35;
+    const st=new THREE.Mesh(new THREE.BoxGeometry(sw,0.14,sd),new THREE.MeshLambertMaterial({{color:0xc0b898}}));
+    st.position.set(0,i*0.14,-rd/2-0.16-(i+0.5)*sd); scene.add(st);
+  }});
+  // Parapet wall on top (for flat-roof sections)
+  if(NUM_FLOORS>1){{
+    const parM=new THREE.MeshLambertMaterial({{color:0xe0d8c8}});
+    const ph=0.4;
+    [
+      [rw+0.1,ph,0.14,0,totalH+ph/2,-rd/2-0.05],
+      [rw+0.1,ph,0.14,0,totalH+ph/2, rd/2+0.05],
+      [0.14,ph,rd,-rw/2-0.05,totalH+ph/2,0],
+      [0.14,ph,rd, rw/2+0.05,totalH+ph/2,0],
+    ].forEach(([w,h,d,x,y,z])=>{{
+      const par=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),parM);
+      par.position.set(x,y,z); scene.add(par);
+    }});
+  }}
+}}
+
+// ── ROOM MESH BUILDER ──────────────────────────────────────────────────────────
+const roomMeshes=[], wallGroups=[], ceilMeshes=[], labelSprites=[];
+
+function makeLabel(name,area){{
+  const c=document.createElement('canvas');c.width=256;c.height=80;
+  const cx2=c.getContext('2d');
+  // Use fillRect for broad browser compatibility (roundRect is not universal).
+  cx2.fillStyle='rgba(26,23,20,0.75)';
+  cx2.fillRect(6,12,244,56);
+  cx2.fillStyle='#c8a96e';cx2.font='500 16px DM Mono,monospace';cx2.textAlign='center';cx2.fillText(name,128,38);
+  cx2.fillStyle='rgba(200,169,110,0.55)';cx2.font='12px DM Mono,monospace';cx2.fillText(area+' sqft',128,55);
+  const t=new THREE.CanvasTexture(c);
+  const s=new THREE.Sprite(new THREE.SpriteMaterial({{map:t,transparent:true,depthTest:false}}));
+  s.scale.set(1.6,0.5,1);return s;
+}}
+
+// ── SHARED-WALL DEDUPLICATION ─────────────────────────────────────────────────
+// Track which wall edges have already been rendered so adjacent rooms don't
+// double-up geometry. Key = "x0,z0,x1,z1,floorY" (rounded to 2dp).
+const _wallRendered=new Set();
+function _wKey(ax,az,bx,bz,fy){{
+  // Normalise direction so (A→B) and (B→A) produce the same key
+  const [x0,z0,x1,z1]=ax<bx||(ax===bx&&az<bz)?[ax,az,bx,bz]:[bx,bz,ax,az];
+  return `${{x0.toFixed(2)}},${{z0.toFixed(2)}},${{x1.toFixed(2)}},${{z1.toFixed(2)}},${{fy.toFixed(2)}}`;
+}}
+function shouldDrawWall(ax,az,bx,bz,fy){{
+  const k=_wKey(ax,az,bx,bz,fy);
+  if(_wallRendered.has(k))return false;
+  _wallRendered.add(k);return true;
+}}
+
+/** Openings from Python __wall_openings (same layout as SVG floor plan). */
+function wallOpsFromPlan(room,wallLetter,wlen){{
+  const raw=room.__wall_openings;
+  if(!Array.isArray(raw)||!raw.length)return null;
+  const pxm=PX2M,wlen2=Math.max(0.06,wlen);
+  const ops=[];
+  raw.forEach(o=>{{
+    if(String(o.wall||'')!==wallLetter)return;
+    const wpx=Number(o.w_px)||24;
+    const wm=Math.max(0.32,Math.min(wpx*pxm,wlen2*0.92));
+    const p=Math.max(0.03,Math.min(0.97,Number(o.pos)||0.5));
+    const k=String(o.kind||'window');
+    if(k==='window')
+      ops.push({{type:'window',pos:p,w:Math.max(0.45,Math.min(wm,1.9)),h:WIN_H,sillY:WIN_SILL}});
+    else
+      ops.push({{type:'door',pos:p,w:Math.min(Math.max(0.5,wm),1.45),h:DOOR_H,sillY:0}});
+  }});
+  if(!ops.length)return null;
+  ops.sort((a,b)=>a.pos-b.pos);
+  return ops;
+}}
+function addPlanFittingsForWall(room,floorY,pos,rw,rd,tN,tS,tW,tE,innerD,wallLetter){{
+  const raw=room.__wall_openings;
+  if(!Array.isArray(raw)||!raw.length)return;
+  const pxm=PX2M;
+  raw.forEach(o=>{{
+    if(String(o.wall||'')!==wallLetter)return;
+    const k=String(o.kind||'');
+    const p=Math.max(0.03,Math.min(0.97,Number(o.pos)||0.5));
+    const wpx=Number(o.w_px)||(k==='window'?22:28);
+    if(k==='window'){{
+      const ww=Math.max(0.42,Math.min(wpx*pxm,2.05));
+      const wm=makeWindow(ww,WIN_H);
+      if(wallLetter==='N'){{wm.position.set(pos.x-rw/2+rw*p,floorY+WIN_SILL,pos.z-rd/2+tN*.5);scene.add(wm);}}
+      else if(wallLetter==='S'){{wm.position.set(pos.x-rw/2+rw*p,floorY+WIN_SILL,pos.z+rd/2-tS*.5);scene.add(wm);}}
+      else if(wallLetter==='W'){{wm.rotation.y=Math.PI/2;wm.position.set(pos.x-rw/2+tW*.5,floorY+WIN_SILL,pos.z-rd/2+tN+innerD*p);scene.add(wm);}}
+      else if(wallLetter==='E'){{wm.rotation.y=Math.PI/2;wm.position.set(pos.x+rw/2-tE*.5,floorY+WIN_SILL,pos.z-rd/2+tN+innerD*p);scene.add(wm);}}
+    }} else if((k==='door'||k==='door_main')&&!o.opening_only){{
+      let dwM=Math.min(Math.max(0.52,wpx*pxm),k==='door_main'?1.55:1.25);
+      if(k==='door_main')dwM=Math.max(dwM,0.95);
+      const dg=makeDoor(dwM,DOOR_H);
+      if(wallLetter==='N'){{dg.position.set(pos.x-rw/2+rw*p,floorY,pos.z-rd/2+tN*.5+.02);scene.add(dg);}}
+      else if(wallLetter==='S'){{dg.rotation.y=Math.PI;dg.position.set(pos.x-rw/2+rw*p,floorY,pos.z+rd/2-tS*.5-.02);scene.add(dg);}}
+      else if(wallLetter==='W'){{dg.rotation.y=-Math.PI/2;dg.position.set(pos.x-rw/2+tW*.5-.02,floorY,pos.z-rd/2+tN+innerD*p);scene.add(dg);}}
+      else if(wallLetter==='E'){{dg.rotation.y=Math.PI/2;dg.position.set(pos.x+rw/2-tE*.5+.02,floorY,pos.z-rd/2+tN+innerD*p);scene.add(dg);}}
+    }}
+  }});
+}}
+
+const totalH = NUM_FLOORS * FLOOR_STEP_M;
+try {{
+ALLROOMS.forEach(room=>{{
+  const pos=p2w((Number(room.x)||0)+(Number(room.width)||0)/2,(Number(room.y)||0)+(Number(room.height)||0)/2);
+  const rw=Math.max(0.02,(Number(room.width)||0)*PX2M), rd=Math.max(0.02,(Number(room.height)||0)*PX2M);
+  const wh=room.__wall_h||2.7;
+  const floorY=room.__floor_y||0;
+  const col=parseInt(room.__color||'0xf5f3ee');
+  const wcol=parseInt(room.__wallColor||'0xd8d4c8');
+  const isOpen=(wh===0);
+  const cat=room.__cat_resolved||'default';
+
+  // Exterior wall detection — TOL in metres, relaxed to handle sub-pixel alignment
+  const TOL=0.5;
+  const rx0=room.x*PX2M, ry0=room.y*PX2M;
+  const bxW=BX*PX2M, byW=BY*PX2M, bwW=BW*PX2M, bhW=BH*PX2M;
+  const extTop  =Math.abs(ry0-byW)<TOL;
+  const extBot  =Math.abs((ry0+rd)-(byW+bhW))<TOL;
+  const extLeft =Math.abs(rx0-bxW)<TOL;
+  const extRight=Math.abs((rx0+rw)-(bxW+bwW))<TOL;
+  const tN=extTop ?EXT_WALL_T:INT_WALL_T;
+  const tS=extBot ?EXT_WALL_T:INT_WALL_T;
+  const tW=extLeft?EXT_WALL_T:INT_WALL_T;
+  const tE=extRight?EXT_WALL_T:INT_WALL_T;
+
+  // Floor slab
+  const fm=new THREE.Mesh(new THREE.BoxGeometry(rw,0.08,rd),new THREE.MeshStandardMaterial({{color:col,roughness:0.74,metalness:0.02}}));
+  fm.position.set(pos.x,floorY+0.04,pos.z);fm.receiveShadow=true;
+  fm.userData={{room,floorY,isFloor:true}};scene.add(fm);roomMeshes.push(fm);
+
+  const wg=new THREE.Group();
+  if(!isOpen){{
+    const wMat=new THREE.MeshLambertMaterial({{color:wcol}});
+    const winC=Math.max(0,parseInt(room.windows)||0);
+    const doorC=parseInt(room.door_count)||0;
+    const wN=Math.ceil(winC*.5),wS=Math.floor(winC*.3),wE=Math.max(0,winC-wN-wS);
+    const hasPlan=Array.isArray(room.__wall_openings);
+
+    function mkOps(nW,hasDoor,len){{
+      const ops=[];
+      if(hasDoor)ops.push({{type:'door',pos:.22,w:DOOR_W,h:DOOR_H,sillY:0}});
+      const denom=Math.max(1,nW+1);
+      for(let i=0;i<nW;i++)ops.push({{type:'window',pos:(i+1)/denom,w:WIN_W,h:WIN_H,sillY:WIN_SILL}});
+      return ops;
+    }}
+    const innerD=Math.max(0.08,rd-tN-tS);
+    const opsN=hasPlan?(wallOpsFromPlan(room,'N',rw)||[]):mkOps(wN,doorC>0,rw);
+    const opsS=hasPlan?(wallOpsFromPlan(room,'S',rw)||[]):mkOps(wS,false,rw);
+    const opsW=hasPlan?(wallOpsFromPlan(room,'W',innerD)||[]):[];
+    const opsE=hasPlan?(wallOpsFromPlan(room,'E',innerD)||[]):mkOps(wE,doorC>1,innerD);
+
+    // North wall — pos.z-rd/2 edge
+    if(shouldDrawWall(pos.x-rw/2,pos.z-rd/2,pos.x+rw/2,pos.z-rd/2,floorY)){{
+    const gN=makeWallWithOpenings(rw,wh,tN,opsN);
+    const mN=new THREE.Mesh(gN,wMat);mN.castShadow=true;
+    mN.position.set(pos.x-rw/2,floorY,pos.z-rd/2);wg.add(mN);
+    if(hasPlan)addPlanFittingsForWall(room,floorY,pos,rw,rd,tN,tS,tW,tE,innerD,'N');
+    else {{
+      if(doorC>0){{const d=makeDoor(DOOR_W,DOOR_H);d.position.set(pos.x-rw/2+rw*.22,floorY,pos.z-rd/2+tN*.5+.01);scene.add(d);}}
+      for(let i=0;i<wN;i++){{const wm=makeWindow(WIN_W,WIN_H);wm.position.set(pos.x-rw/2+rw*(i+1)/Math.max(1,wN+1),floorY+WIN_SILL,pos.z-rd/2+tN*.5);scene.add(wm);}}
+    }}
+    }}
+    // South wall — pos.z+rd/2 edge
+    if(shouldDrawWall(pos.x-rw/2,pos.z+rd/2,pos.x+rw/2,pos.z+rd/2,floorY)){{
+    const gS=makeWallWithOpenings(rw,wh,tS,opsS);
+    const mS=new THREE.Mesh(gS,wMat);mS.castShadow=true;
+    mS.position.set(pos.x-rw/2,floorY,pos.z+rd/2-tS);wg.add(mS);
+    if(hasPlan)addPlanFittingsForWall(room,floorY,pos,rw,rd,tN,tS,tW,tE,innerD,'S');
+    else {{
+      for(let i=0;i<wS;i++){{const wm=makeWindow(WIN_W,WIN_H);wm.position.set(pos.x-rw/2+rw*(i+1)/Math.max(1,wS+1),floorY+WIN_SILL,pos.z+rd/2-tS*.5);scene.add(wm);}}
+    }}
+    }}
+    // West wall — pos.x-rw/2 edge
+    if(shouldDrawWall(pos.x-rw/2,pos.z-rd/2,pos.x-rw/2,pos.z+rd/2,floorY)){{
+    const gW=makeWallWithOpenings(innerD,wh,tW,opsW);
+    const mW=new THREE.Mesh(gW,wMat);mW.castShadow=true;mW.rotation.y=Math.PI/2;
+    mW.position.set(pos.x-rw/2+tW,floorY,pos.z-rd/2+tN);wg.add(mW);
+    if(hasPlan)addPlanFittingsForWall(room,floorY,pos,rw,rd,tN,tS,tW,tE,innerD,'W');
+    }}
+    // East wall — pos.x+rw/2 edge
+    if(shouldDrawWall(pos.x+rw/2,pos.z-rd/2,pos.x+rw/2,pos.z+rd/2,floorY)){{
+    const gE=makeWallWithOpenings(innerD,wh,tE,opsE);
+    const mE=new THREE.Mesh(gE,wMat);mE.castShadow=true;mE.rotation.y=Math.PI/2;
+    mE.position.set(pos.x+rw/2-tE*2,floorY,pos.z-rd/2+tN);wg.add(mE);
+    if(hasPlan)addPlanFittingsForWall(room,floorY,pos,rw,rd,tN,tS,tW,tE,innerD,'E');
+    else {{
+      for(let i=0;i<wE;i++){{const wm=makeWindow(WIN_W,WIN_H);wm.position.set(pos.x+rw/2-tE*.5,floorY+WIN_SILL,pos.z-rd/2+tN+innerD*(i+1)/Math.max(1,wE+1));scene.add(wm);}}
+    }}
+    }}
+    // Floor slab between floors
+    if(floorY>0){{
+      const slabM=new THREE.MeshLambertMaterial({{color:0xd0c8b8}});
+      const slab=new THREE.Mesh(new THREE.BoxGeometry(rw,0.2,rd),slabM);
+      slab.position.set(pos.x,floorY-0.1,pos.z);slab.receiveShadow=true;scene.add(slab);
+    }}
+  }} else if(isOpen&&(cat==='balcony'||cat==='terrace'||cat==='sit_out')){{
+    const prH=1.06, prT=0.11;
+    const stM=new THREE.MeshStandardMaterial({{color:wcol,roughness:0.58,metalness:0.05}});
+    const glM=new THREE.MeshStandardMaterial({{color:0xb8d4f0,transparent:true,opacity:0.32,roughness:0.2,metalness:0.08,side:THREE.DoubleSide}});
+    if(extTop){{
+      const m=new THREE.Mesh(new THREE.BoxGeometry(rw,prH,prT),stM);m.position.set(pos.x,floorY+prH/2,pos.z-rd/2+prT/2);m.castShadow=true;wg.add(m);
+      const g=new THREE.Mesh(new THREE.BoxGeometry(rw*0.9,prH*0.5,0.02),glM);g.position.set(pos.x,floorY+prH*0.48,pos.z-rd/2+prT+0.01);wg.add(g);
+    }}
+    if(extBot){{
+      const m=new THREE.Mesh(new THREE.BoxGeometry(rw,prH,prT),stM);m.position.set(pos.x,floorY+prH/2,pos.z+rd/2-prT/2);m.castShadow=true;wg.add(m);
+      const g=new THREE.Mesh(new THREE.BoxGeometry(rw*0.9,prH*0.5,0.02),glM);g.position.set(pos.x,floorY+prH*0.48,pos.z+rd/2-prT-0.01);wg.add(g);
+    }}
+    if(extLeft){{
+      const m=new THREE.Mesh(new THREE.BoxGeometry(prT,prH,rd),stM);m.position.set(pos.x-rw/2+prT/2,floorY+prH/2,pos.z);m.castShadow=true;wg.add(m);
+      const g=new THREE.Mesh(new THREE.BoxGeometry(0.02,prH*0.5,rd*0.9),glM);g.position.set(pos.x-rw/2+prT+0.01,floorY+prH*0.48,pos.z);wg.add(g);
+    }}
+    if(extRight){{
+      const m=new THREE.Mesh(new THREE.BoxGeometry(prT,prH,rd),stM);m.position.set(pos.x+rw/2-prT/2,floorY+prH/2,pos.z);m.castShadow=true;wg.add(m);
+      const g=new THREE.Mesh(new THREE.BoxGeometry(0.02,prH*0.5,rd*0.9),glM);g.position.set(pos.x+rw/2-prT-0.01,floorY+prH*0.48,pos.z);wg.add(g);
+    }}
+  }}
+  scene.add(wg);wallGroups.push({{grp:wg,wh,floorY}});
+
+  // Ceiling
+  if(!isOpen){{
+    const cm=new THREE.Mesh(new THREE.BoxGeometry(rw,0.06,rd),new THREE.MeshLambertMaterial({{color:0xf8f4ec}}));
+    cm.position.set(pos.x,floorY+wh-0.03,pos.z);cm.receiveShadow=true;scene.add(cm);ceilMeshes.push(cm);
+  }} else ceilMeshes.push(null);
+
+  // Label
+  const lbl=makeLabel(_roomDispStr(room),room.area_sqft||0);
+  const lblY=(isOpen&&(cat==='balcony'||cat==='terrace'||cat==='sit_out'))?floorY+1.22:floorY+wh*.5+.3;
+  lbl.position.set(pos.x,lblY,pos.z);scene.add(lbl);labelSprites.push(lbl);
+
+  // Dimension annotation — floating dim line just above floor
+  (function(){{
+    const ftW=room.width_ft||Math.round(rw*3.281);
+    const ftD=room.depth_ft||Math.round(rd*3.281);
+    const dc=document.createElement('canvas');dc.width=160;dc.height=32;
+    const dx=dc.getContext('2d');
+    dx.fillStyle='rgba(26,23,20,0.0)';dx.fillRect(0,0,160,32);
+    dx.fillStyle='rgba(200,169,110,0.85)';dx.font="bold 13px 'DM Mono',monospace";
+    dx.textAlign='center';dx.fillText(`${{ftW}}' × ${{ftD}}'`,80,20);
+    const dt=new THREE.CanvasTexture(dc);
+    const ds=new THREE.Sprite(new THREE.SpriteMaterial({{map:dt,transparent:true,depthTest:false}}));
+    ds.scale.set(1.0,0.2,1);
+    ds.position.set(pos.x,floorY+0.12,pos.z);
+    scene.add(ds);
+  }})();
+
+  // Furniture
+  addFurniture3D(room, floorY);
+}});
+buildExterior(totalH);
+buildRoof(totalH + 0.06);
+}} catch(e) {{ showFatal(e.message||String(e)); }}
+
+// ── WALK NAV (expanded room cells + stair volumes + plot exterior) ───────────
+const NAV_MERGE_PAD=0.14;
+const pwNav=LAYOUT.plot_w_px*PX2M, phNav=LAYOUT.plot_h_px*PX2M;
+const halfWb=BW*PX2M/2+0.22, halfDb=BH*PX2M/2+0.22;
+const navCells=[];
+ALLROOMS.forEach(r=>{{
+  const cat=r.__cat_resolved||'default';
+  if(cat==='staircase')return;
+  const pos=p2w((Number(r.x)||0)+(Number(r.width)||0)/2,(Number(r.y)||0)+(Number(r.height)||0)/2);
+  const rw2=Math.max(0.06,(Number(r.width)||0)*PX2M/2+NAV_MERGE_PAD);
+  const rd2=Math.max(0.06,(Number(r.height)||0)*PX2M/2+NAV_MERGE_PAD);
+  const fy=Number(r.__floor_y)||0;
+  const whNav=Math.max(0.55,Number(r.__wall_h)||2.7);
+  navCells.push({{minX:pos.x-rw2,maxX:pos.x+rw2,minZ:pos.z-rd2,maxZ:pos.z+rd2,fy,top:fy+whNav+0.35}});
+}});
+function currentWalkFloorIdx(footY){{
+  return Math.max(0,Math.min(NUM_FLOORS-1,Math.floor((footY+0.35)/FLOOR_STEP_M)));
+}}
+function footInStairVol(x,z,y){{
+  for(let ri=0;ri<ALLROOMS.length;ri++){{
+    const r=ALLROOMS[ri], vols=r.__stairNav;
+    if(!vols||!vols.length)continue;
+    for(let vi=0;vi<vols.length;vi++){{
+      const v=vols[vi];
+      if(y<v.y0-0.12||y>v.y1+0.22)continue;
+      if(x>=v.minX&&x<=v.maxX&&z>=v.minZ&&z<=v.maxZ)return true;
+    }}
+  }}
+  return false;
+}}
+function footInRoomNav(x,z,y){{
+  for(let i=0;i<navCells.length;i++){{
+    const n=navCells[i];
+    if(y<n.fy-0.48||y>n.top)continue;
+    if(x>=n.minX&&x<=n.maxX&&z>=n.minZ&&z<=n.maxZ)return true;
+  }}
+  return false;
+}}
+function clampPlotXZ(x,z){{
+  const m=0.48;
+  return {{x:Math.max(-pwNav/2+m,Math.min(pwNav/2-m,x)),z:Math.max(-phNav/2+m,Math.min(phNav/2-m,z))}};
+}}
+function tryWalkPosition(x,z,y){{
+  const p=clampPlotXZ(x,z);x=p.x;z=p.z;
+  const insideShell=Math.abs(x)<=halfWb&&Math.abs(z)<=halfDb;
+  if(footInStairVol(x,z,y))return p;
+  if(footInRoomNav(x,z,y))return p;
+  if(!insideShell)return p;
+  return null;
+}}
+function tryWalkDelta(dx,dz,footY){{
+  let r=tryWalkPosition(wPos.x+dx,wPos.z+dz,footY);
+  if(r)return r;
+  r=tryWalkPosition(wPos.x+dx,wPos.z,footY);
+  if(r)return r;
+  r=tryWalkPosition(wPos.x,wPos.z+dz,footY);
+  if(r)return r;
+  return null;
+}}
+function snapWalkToFloor(){{
+  walkRay.set(new THREE.Vector3(wPos.x,wPos.y+2.4,wPos.z),new THREE.Vector3(0,-1,0));
+  const slabs=roomMeshes.filter(m=>m.userData&&m.userData.isFloor);
+  const hits=walkRay.intersectObjects(slabs.concat(__walkPickMeshes),false);
+  let gy=null;
+  for(let hi=0;hi<hits.length;hi++){{
+    const h=hits[hi], y=h.point.y;
+    if(y>wPos.y+0.55)continue;
+    if(y<-0.2)continue;
+    if(gy===null||y>gy)gy=y;
+  }}
+  if(gy!==null)wPos.y=gy+wEye-0.04;
+  else wPos.y=wEye+0.02;
+}}
+
+// Vastu per-room floor overlay — colour each room by zone compliance
+(function(){{
+  // Vastu 8-zone map: facing=north means plot-north is top (negative Z in world)
+  // Ideal zones: NE=pooja/prayer, E=kitchen/bathroom, SE=kitchen, S=heavy storage,
+  // SW=master bedroom, W=bathroom/study, NW=guest/utility, N=living
+  const VASTU_IDEAL={{
+    'living_room':['N','NE'],'dining_room':['W','N'],'master_bedroom':['SW','S','W'],
+    'bedroom':['S','W','NW'],'kitchen':['SE','E'],'wet_kitchen':['SE','E'],
+    'dry_kitchen':['SE','E'],'bathroom':['W','N','NW'],'common_bathroom':['W','NW'],
+    'pooja_room':['NE','E'],'home_office':['W','NW'],'guest_bedroom':['NW','W'],
+    'utility_room':['NW','W'],'store_room':['S','SW'],'servant_quarters':['NW'],
+  }};
+  const CX=(BX+BW/2)*PX2M-OX, CZ=(BY+BH/2)*PX2M-OZ;
+  ALLROOMS.forEach(room=>{{
+    const pos=p2w(room.x+room.width/2,room.y+room.height/2);
+    const rw=room.width*PX2M, rd=room.height*PX2M;
+    const cat=room.__cat_resolved||'default';
+    const floorY=room.__floor_y||0;
+    // Determine zone relative to building centre
+    const dx=pos.x-CX, dz=pos.z-CZ;
+    const ang=((Math.atan2(dx,-dz)*180/Math.PI)+360)%360;
+    const zones=['N','NE','E','SE','S','SW','W','NW'];
+    const zone=zones[Math.round(ang/45)%8];
+    const ideal=VASTU_IDEAL[cat]||[];
+    const good=ideal.includes(zone);
+    const neutral=ideal.length===0;
+    const clr=neutral?0x888888:good?0x3a8a3a:0xcc4444;
+    const geo=new THREE.PlaneGeometry(rw*0.92,rd*0.92);
+    const mat=new THREE.MeshBasicMaterial({{color:clr,transparent:true,opacity:0.13,depthWrite:false}});
+    const ov=new THREE.Mesh(geo,mat);
+    ov.rotation.x=-Math.PI/2;ov.position.set(pos.x,floorY+0.05,pos.z);
+    scene.add(ov);
+    // Zone label sprite
+    const zc=document.createElement('canvas');zc.width=80;zc.height=28;
+    const zx=zc.getContext('2d');
+    zx.fillStyle=neutral?'#888':good?'#2a7a2a':'#aa3333';
+    zx.font='bold 11px DM Mono,monospace';zx.textAlign='center';
+    zx.fillText(zone,40,18);
+    const zt=new THREE.CanvasTexture(zc);
+    const zs=new THREE.Sprite(new THREE.SpriteMaterial({{map:zt,transparent:true,depthTest:false}}));
+    zs.scale.set(.5,.18,1);zs.position.set(pos.x,floorY+0.08,pos.z+rd*.28);
+    scene.add(zs);
+  }});
+  // Directional compass ring (keep but smaller, just as orientation aid)
+  const c=document.createElement('canvas');c.width=c.height=256;
+  const cx2=c.getContext('2d');
+  cx2.strokeStyle='rgba(200,169,110,0.18)';cx2.lineWidth=1;cx2.beginPath();cx2.arc(128,128,118,0,Math.PI*2);cx2.stroke();
+  ['N','E','S','W'].forEach((d,i)=>{{
+    const a=i*(Math.PI/2)-Math.PI/2;
+    cx2.fillStyle='rgba(200,169,110,0.5)';cx2.font='bold 16px sans-serif';cx2.textAlign='center';cx2.textBaseline='middle';
+    cx2.fillText(d,128+Math.cos(a)*96,128+Math.sin(a)*96);
+  }});
+  const t=new THREE.CanvasTexture(c);
+  const compassOv=new THREE.Mesh(new THREE.PlaneGeometry(BW*PX2M,BH*PX2M),new THREE.MeshBasicMaterial({{map:t,transparent:true,depthWrite:false}}));
+  compassOv.rotation.x=-Math.PI/2;compassOv.position.y=.001;scene.add(compassOv);
+}})();
+
+// ── VIEW PRESETS ──────────────────────────────────────────────────────────────
+function animTo(nth,nph,nr,ms){{
+  const st=Date.now(),sth=th,sph=ph,sr=cr;
+  (function s(){{
+    const t=Math.min(1,(Date.now()-st)/ms),e=t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+    th=sth+(nth-sth)*e;ph=sph+(nph-sph)*e;cr=sr+(nr-sr)*e;camUpdate();
+    if(t<1)requestAnimationFrame(s);
+  }})();
+}}
+
+let exploded=false;
+function setView(m){{
+  ['iso','top','front','back','side','exterior','explode','walk'].forEach(v=>document.getElementById('btn-'+v)?.classList.remove('active'));
+  document.getElementById('btn-'+m)?.classList.add('active');
+  if(m==='iso')     {{resetExplode();animTo(FRONT_YAW-0.55,0.9,22,600);}}
+  else if(m==='top') {{resetExplode();animTo(FRONT_YAW-0.55,0.04,20,600);}}
+  else if(m==='front'){{resetExplode();animTo(FRONT_YAW,1.2,18,600);}}
+  else if(m==='back') {{resetExplode();animTo(FRONT_YAW+Math.PI,1.2,18,600);}}
+  else if(m==='side') {{resetExplode();animTo(FRONT_YAW+Math.PI*0.5,1.0,18,600);}}
+  else if(m==='exterior'){{resetExplode();animTo(FRONT_YAW-0.32,0.72,34,700);}}
+  else if(m==='explode'){{doExplode();animTo(FRONT_YAW-0.55,0.5,34,600);}}
+  else if(m==='walk'){{enterWalk();return;}}
+}}
+function resetExplode(){{
+  if(!exploded)return; exploded=false;
+  roomMeshes.forEach((_,i)=>animMeshY(i,0,400));
+}}
+function doExplode(){{
+  if(exploded)return; exploded=true;
+  ALLROOMS.forEach((_,i)=>setTimeout(()=>animMeshY(i,ALLROOMS[i].__wall_h+0.5+i*0.12,350),i*60));
+}}
+function animMeshY(i,ty,ms){{
+  const mesh=roomMeshes[i],wg=wallGroups[i],cm=ceilMeshes[i],ls=labelSprites[i];
+  const wh=(wg?.wh||2.7),fy=wg?.floorY||0;
+  const sy=mesh.position.y,st2=Date.now();
+  (function s(){{
+    const t=Math.min(1,(Date.now()-st2)/ms),e=t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+    const y=sy+(ty+fy+.04-sy)*e;
+    mesh.position.y=y;
+    if(wg)wg.grp.position.y=ty+fy;
+    if(cm?.position)cm.position.y=fy+wh-.03+ty;
+    if(ls)ls.position.y=fy+wh*.5+.3+ty;
+    if(t<1)requestAnimationFrame(s);
+  }})();
+}}
+
+// ── CUTAWAY ────────────────────────────────────────────────────────────────────
+function setCutaway(v){{
+  document.getElementById('cv').textContent=v+'%';
+  wallGroups.forEach(wg=>{{
+    const pct=v/100,wh=wg.wh;
+    wg.grp.children.forEach(m=>{{
+      if(!m.isMesh)return;
+      m.scale.y=Math.max(0.02,pct);
+      m.position.y=wg.floorY||0;
+    }});
+  }});
+}}
+
+// ── WALKTHROUGH (first-person: nav + floor snap + pointer lock) ───────────────
+function enterWalk(){{
+  resetExplode();
+  walkMode=true;
+  document.getElementById('walkmode-overlay').classList.add('active');
+  document.getElementById('walkhud').style.display='flex';
+  wEye=1.62;
+  const back=Math.max(3.5,Math.min(BW,BH)*PX2M*0.22);
+  wPos.set(Math.sin(FRONT_YAW)*back,wEye+0.06,Math.cos(FRONT_YAW)*back);
+  wAngle=FRONT_YAW+Math.PI;
+  wPitch=0;
+  snapWalkToFloor();
+  camera.fov=72;camera.updateProjectionMatrix();
+  document.getElementById('btn-walk')?.classList.add('active');
+  const lockOnce=function(){{
+    try{{wrap.requestPointerLock();}}catch(_e){{}}
+    wrap.removeEventListener('click',lockOnce);
+  }};
+  wrap.addEventListener('click',lockOnce);
+}}
+function exitWalk(){{
+  walkMode=false;
+  try{{document.exitPointerLock();}}catch(_e){{}}
+  document.getElementById('walkmode-overlay').classList.remove('active');
+  document.getElementById('walkhud').style.display='none';
+  camera.fov=42;camera.updateProjectionMatrix();
+  wEye=1.62;
+  ['iso','top','front','back','side','exterior','explode','walk'].forEach(v=>document.getElementById('btn-'+v)?.classList.remove('active'));
+  document.getElementById('btn-iso')?.classList.add('active');
+  animTo(FRONT_YAW-0.55,0.9,22,600);
+}}
+function wMove(fwd,str){{
+  const spd=WALK_BASE*1.08;
+  const foot=wPos.y-wEye+0.05;
+  const lx=Math.sin(wAngle)*spd*fwd+Math.cos(wAngle)*spd*str;
+  const lz=Math.cos(wAngle)*spd*fwd-Math.sin(wAngle)*spd*str;
+  const r=tryWalkDelta(lx,lz,foot);
+  if(r){{wPos.x=r.x;wPos.z=r.z;}}
+}}
+function wTurn(dir){{wAngle+=dir*0.09;}}
+function walkLook(e){{if(!walkMode)return;}}
+function onWinKeyDown(e){{
+  if(walkMode){{
+    wKeys[e.code]=true;
+    if(e.code==='Escape'){{exitWalk();e.preventDefault();}}
+    return;
+  }}
+  const st=0.056;
+  if(e.code==='ArrowLeft'){{th-=st;camUpdate();e.preventDefault();}}
+  else if(e.code==='ArrowRight'){{th+=st;camUpdate();e.preventDefault();}}
+  else if(e.code==='ArrowUp'){{ph=Math.max(0.08,ph-st*0.55);camUpdate();e.preventDefault();}}
+  else if(e.code==='ArrowDown'){{ph=Math.min(1.55,ph+st*0.55);camUpdate();e.preventDefault();}}
+  else if(e.code==='PageUp'){{cr=Math.max(4,cr-1.4);camUpdate();e.preventDefault();}}
+  else if(e.code==='PageDown'){{cr=Math.min(85,cr+1.4);camUpdate();e.preventDefault();}}
+}}
+function onWinKeyUp(e){{wKeys[e.code]=false;}}
+window.addEventListener('keydown',onWinKeyDown,true);
+window.addEventListener('keyup',onWinKeyUp,true);
+function updateWalk(){{
+  if(!walkMode)return;
+  const spd=(wKeys['ShiftLeft']||wKeys['ShiftRight'])?WALK_RUN:WALK_BASE;
+  const foot=wPos.y-wEye+0.05;
+  let dx=0,dz=0;
+  const fx=Math.sin(wAngle)*spd,fz=Math.cos(wAngle)*spd;
+  if(wKeys['KeyW']||wKeys['ArrowUp']){{dx+=fx;dz+=fz;}}
+  if(wKeys['KeyS']||wKeys['ArrowDown']){{dx-=fx;dz-=fz;}}
+  if(wKeys['KeyA']){{dx-=Math.cos(wAngle)*spd;dz+=Math.sin(wAngle)*spd;}}
+  if(wKeys['KeyD']){{dx+=Math.cos(wAngle)*spd;dz-=Math.sin(wAngle)*spd;}}
+  const r=tryWalkDelta(dx,dz,foot);
+  if(r){{wPos.x=r.x;wPos.z=r.z;}}
+  if(wKeys['ArrowLeft']||wKeys['KeyQ'])wAngle-=0.042;
+  if(wKeys['ArrowRight']||wKeys['KeyE'])wAngle+=0.042;
+  const tgtEye=(wKeys['KeyC'])?1.14:1.62;
+  wEye+=(tgtEye-wEye)*0.22;
+  snapWalkToFloor();
+  camera.position.copy(wPos);
+  const dirx=Math.sin(wAngle)*Math.cos(wPitch),diry=Math.sin(wPitch),dirz=Math.cos(wAngle)*Math.cos(wPitch);
+  camera.lookAt(wPos.x+dirx,wPos.y+diry,wPos.z+dirz);
+}}
+
+// ── RAYCASTER + DRAG ─────────────────────────────────────────────────────────
+const ray=new THREE.Raycaster(),mv=new THREE.Vector2();
+const tt=document.getElementById('tooltip');
+let hm=null,dragMesh=null,dragPlane=new THREE.Plane(new THREE.Vector3(0,1,0),0),dragOffset=new THREE.Vector3();
+
+function getMV(e){{const r=wrap.getBoundingClientRect();mv.x=((e.clientX-r.left)/getW())*2-1;mv.y=((e.clientY-r.top)/getH())*-2+1;}}
+function handleHover(e){{
+  if(walkMode||orb.active)return;
+  getMV(e);ray.setFromCamera(mv,camera);
+  const hits=ray.intersectObjects(roomMeshes);
+  if(hits.length){{
+    const room=hits[0].object.userData.room;
+    tt.style.cssText=`display:block;left:${{e.clientX+14}}px;top:${{e.clientY-10}}px`;
+    document.getElementById('ttn').textContent=_roomDispStr(room);
+    document.getElementById('ttd').textContent=`${{room.width_ft||'?'}}ft×${{room.depth_ft||'?'}}ft = ${{room.area_sqft||'?'}} sqft`;
+    document.getElementById('ttv').textContent=`Vastu: ${{room.__vastu_zone||'—'}}`;
+    if(hm!==hits[0].object){{if(hm)hm.material.emissive?.set(0);hm=hits[0].object;if(hm.material.emissive)hm.material.emissive.set(0x0a0806);}}
+  }} else {{tt.style.display='none';if(hm){{hm.material.emissive?.set(0);hm=null;}}}}
+}}
+wrap.addEventListener('click',e=>{{
+  if(walkMode||orb.active||exploded)return;
+  getMV(e);ray.setFromCamera(mv,camera);
+  const hits=ray.intersectObjects(roomMeshes);
+  if(hits.length){{
+    const room=hits[0].object.userData.room;
+    const pos=p2w(room.x+room.width/2,room.y+room.height/2);
+    ctx=pos.x;ctz=pos.z;animTo(th,ph,10,400);
+    setTimeout(()=>{{ctx=0;ctz=0;}},2200);
+    document.querySelectorAll('.room-tag').forEach(t=>t.classList.remove('active'));
+    document.getElementById('rt-'+_roomIdSafe(room))?.classList.add('active');
+    const si=document.getElementById('sel-info');
+    document.getElementById('sel-name').textContent=_roomDispStr(room);
+    document.getElementById('sel-detail').textContent=`${{room.width_ft||0}}ft × ${{room.depth_ft||0}}ft · ${{room.area_sqft||0}} sqft`;
+    si.style.display='block';
+  }}
+}});
+
+// ── TABS ──────────────────────────────────────────────────────────────────────
+function showTab(t){{
+  const ids=['view','plan','rooms','score','sun','measure','boq'];
+  ids.forEach(id=>{{
+    document.getElementById('tab-'+id).style.display=id===t?'':'none';
+  }});
+  document.querySelectorAll('.tab').forEach((btn,i)=>btn.classList.toggle('active',ids[i]===t));
+}}
+
+// ── 2D SVG PLAN ───────────────────────────────────────────────────────────────
+let svgOpen=false,svgScale=1;
+let svgDragging=null,svgDragOx=0,svgDragOy=0,svgDragX=0,svgDragY=0;
+
+function toggle2D(){{
+  svgOpen=!svgOpen;
+  const sw=document.getElementById('svg-wrap');
+  sw.style.display=svgOpen?'block':'none';
+  if(svgOpen&&!sw.innerHTML)buildSVG();
+}}
+
+function svgZoom(f){{svgScale*=f;const sv=document.getElementById('main-svg');if(sv)sv.style.transform=`scale(${{svgScale}})`;}}
+
+function buildSVG(){{
+  const sw=document.getElementById('svg-wrap');
+  const cw=LAYOUT.canvas_w||800,ch=LAYOUT.canvas_h||900;
+  let svg=`<svg id="main-svg" viewBox="0 0 ${{cw}} ${{ch}}" style="width:${{cw}}px;height:${{ch}}px;transform-origin:top left" xmlns="http://www.w3.org/2000/svg">`;
+  svg+=`<rect width="${{cw}}" height="${{ch}}" fill="#f4f0e8"/>`;
+  // Plot boundary
+  svg+=`<rect x="${{BX}}" y="${{BY}}" width="${{BW}}" height="${{BH}}" fill="white" stroke="#1a1a1a" stroke-width="9"/>`;
+  const COLORS={{'living_room':'#e8f4e8','dining_room':'#e0f7fa','master_bedroom':'#ede7f6','bedroom':'#e8eaf6','kitchen':'#fff3e0','bathroom':'#e3f2fd','common_bathroom':'#e3f2fd','corridor':'#f5f5f5','staircase':'#fafafa','car_porch':'#eceff1','sit_out':'#f1f8e9','store_room':'#efebe9','home_office':'#fce4ec','balcony':'#f1f8e9','terrace':'#e8f5e9','family_lounge':'#e8f4e8','pooja_room':'#fff9c4','default':'#f8f8f8'}};
+  ROOMS.forEach((r,i)=>{{
+    const cat=r.__cat_resolved||'default';
+    const fc=COLORS[cat]||COLORS.default;
+    svg+=`<g id="svg-room-${{i}}" class="svg-drag" transform="translate(0,0)" style="cursor:move">`;
+    svg+=`<rect x="${{r.x}}" y="${{r.y}}" width="${{r.width}}" height="${{r.height}}" fill="${{fc}}" stroke="#1a1a1a" stroke-width="4"/>`;
+    // Door arc
+    const dw=Math.min(r.width*.28,28);
+    svg+=`<path d="M ${{r.x+6}} ${{r.y}} A ${{dw}} ${{dw}} 0 0 0 ${{r.x+6+dw}} ${{r.y}}" fill="none" stroke="#1a1a1a" stroke-width="0.8"/>`;
+    svg+=`<line x1="${{r.x+6}}" y1="${{r.y}}" x2="${{r.x+6}}" y2="${{r.y+dw}}" stroke="#1a1a1a" stroke-width="0.8"/>`;
+    // Window
+    const wx=r.x+r.width*.6,wlen=Math.min(r.width*.3,32);
+    svg+=`<rect x="${{wx}}" y="${{r.y+r.height-8}}" width="${{wlen}}" height="8" fill="#cce8ff" stroke="#4f8ef7" stroke-width="0.6"/>`;
+    [.33,.5,.67].forEach(t=>svg+=`<line x1="${{wx+wlen*t}}" y1="${{r.y+r.height-7}}" x2="${{wx+wlen*t}}" y2="${{r.y+r.height-1}}" stroke="#4f8ef7" stroke-width="0.6"/>`);
+    // Label
+    svg+=`<text x="${{r.x+r.width/2}}" y="${{r.y+r.height/2-4}}" text-anchor="middle" font-family="DM Mono,monospace" font-size="9" font-weight="600" fill="#1a1a1a">${{(r.__label||r.name).replace(/_/g,' ').toUpperCase()}}</text>`;
+    svg+=`<text x="${{r.x+r.width/2}}" y="${{r.y+r.height/2+9}}" text-anchor="middle" font-family="DM Mono,monospace" font-size="7" fill="#666">${{r.width_ft||0}}' × ${{r.depth_ft||0}}'</text>`;
+    svg+=`</g>`;
+  }});
+  svg+=`</svg>`;
+  sw.innerHTML=svg;
+
+  // Make SVG rooms draggable
+  sw.querySelectorAll('.svg-drag').forEach((el,i)=>{{
+    let ox=0,oy=0,tx=0,ty=0,dragging=false;
+    el.addEventListener('mousedown',e=>{{
+      dragging=true;ox=e.clientX-tx;oy=e.clientY-ty;e.stopPropagation();
+    }});
+    window.addEventListener('mousemove',e=>{{
+      if(!dragging)return;
+      tx=e.clientX-ox;ty=e.clientY-oy;
+      el.setAttribute('transform',`translate(${{tx}},${{ty}})`);
+      // Sync to 3D
+      if(roomMeshes[i]){{
+        const nr=ROOMS[i];
+        const newX=(nr.x+tx/svgScale)*PX2M,newZ=(nr.y+ty/svgScale)*PX2M;
+        const wp=p2w((nr.x+tx/svgScale)+nr.width/2,(nr.y+ty/svgScale)+nr.height/2);
+        roomMeshes[i].position.x=wp.x;
+        roomMeshes[i].position.z=wp.z;
+        if(wallGroups[i]){{wallGroups[i].grp.position.x=wp.x;wallGroups[i].grp.position.z=wp.z;}}
+        if(ceilMeshes[i]&&ceilMeshes[i].position){{ceilMeshes[i].position.x=wp.x;ceilMeshes[i].position.z=wp.z;}}
+        if(labelSprites[i]){{labelSprites[i].position.x=wp.x;labelSprites[i].position.z=wp.z;}}
+      }}
+    }});
+    window.addEventListener('mouseup',()=>dragging=false);
+  }});
+}}
+
+// ── PANEL: ROOMS ──────────────────────────────────────────────────────────────
+const rl=document.getElementById('rl');
+ROOMS.forEach(room=>{{
+  const tag=document.createElement('div');tag.className='room-tag';tag.id='rt-'+_roomIdSafe(room);
+  const col=(room.__color||'0xf5f3ee').replace('0x','#');
+  tag.innerHTML=`<div class="sw" style="background:${{col}}"></div><span style="flex:1">${{_roomDispStr(room)}}</span><span style="font-size:10px;color:var(--muted)">${{room.area_sqft||0}}ft²</span>`;
+  tag.onclick=()=>{{
+    const pos=p2w(room.x+room.width/2,room.y+room.height/2);
+    ctx=pos.x;ctz=pos.z;animTo(th,ph,10,400);setTimeout(()=>{{ctx=0;ctz=0;}},2200);
+    document.querySelectorAll('.room-tag').forEach(t=>t.classList.remove('active'));tag.classList.add('active');
+  }};
+  rl.appendChild(tag);
+}});
+
+// ── PANEL: SCORE ──────────────────────────────────────────────────────────────
+const sbars=document.getElementById('sbars');
+const scoreLabels={{'vastu_compliance':'Vastu','adjacency_quality':'Adj.','circulation':'Circ.','area_accuracy':'Area','privacy_gradient':'Privacy','natural_light':'Light'}};
+const scoreMax={{'vastu_compliance':25,'adjacency_quality':20,'circulation':20,'area_accuracy':15,'privacy_gradient':10,'natural_light':10}};
+Object.entries(SCORE||{{}}).forEach(([k,v])=>{{
+  const pct=Math.round(v/(scoreMax[k]||10)*100);
+  const row=document.createElement('div');row.className='sbr';
+  row.innerHTML=`<div class="sbl">${{scoreLabels[k]||k}}</div><div class="sbt"><div class="sbf" style="width:${{pct}}%"></div></div><div style="font-size:9px;color:var(--muted);width:18px;text-align:right">${{v}}</div>`;
+  sbars.appendChild(row);
+}});
+
+// ── FLOOR BUTTONS ─────────────────────────────────────────────────────────────
+const floorBtns=document.getElementById('floor-btns');
+for(let fi=0;fi<NUM_FLOORS;fi++){{
+  const btn=document.createElement('button');btn.className='ctrl-btn'+(fi===0?' active':'');
+  btn.textContent=['Ground','First','Second','Third'][fi]+' Fl.';
+  btn.onclick=()=>{{
+    document.querySelectorAll('#floor-btns .ctrl-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    const fy=fi*FLOOR_STEP_M;
+    ctx=0;ctz=0;animTo(th,ph,18,600);
+    setTimeout(()=>{{camera.position.y+=fy;camera.lookAt(0,fy,0);}},650);
+  }};
+  floorBtns.appendChild(btn);
+}}
+
+// ── SUN PATH ──────────────────────────────────────────────────────────────────
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const MDAYS=[0,31,59,90,120,151,181,212,243,273,304,334];
+function dayToDate(d){{
+  let m=0;for(let i=0;i<12;i++)if(d>MDAYS[i])m=i;
+  return MON[m]+' '+(d-MDAYS[m]);
+}}
+function updateSunPath(){{
+  const day=parseFloat(document.getElementById('sun-day').value);
+  const hr=parseFloat(document.getElementById('sun-hr').value);
+  const lat=parseFloat(document.getElementById('sun-lat').value)*Math.PI/180;
+  document.getElementById('sun-day-lbl').textContent=dayToDate(day);
+  document.getElementById('sun-hr-lbl').textContent=Math.floor(hr)+':'+(hr%1===0?'00':Math.round((hr%1)*60)).toString().padStart(2,'0');
+  document.getElementById('sun-lat-lbl').textContent=parseFloat(document.getElementById('sun-lat').value).toFixed(1)+'°';
+  // Solar declination
+  const decl=23.45*Math.PI/180*Math.sin(2*Math.PI*(284+day)/365);
+  // Hour angle (solar noon = 0)
+  const ha=(hr-12)*15*Math.PI/180;
+  // Altitude and azimuth
+  const sinAlt=Math.sin(lat)*Math.sin(decl)+Math.cos(lat)*Math.cos(decl)*Math.cos(ha);
+  const alt=Math.asin(Math.max(0,sinAlt));
+  const cosAz=(Math.sin(decl)-Math.sin(lat)*sinAlt)/(Math.cos(lat)*Math.cos(alt)+0.0001);
+  const az=Math.acos(Math.max(-1,Math.min(1,cosAz)))*(ha>0?-1:1);
+  const dist=60;
+  if(sun){{
+    sun.position.set(dist*Math.sin(az)*Math.cos(alt), dist*Math.sin(alt), dist*Math.cos(az)*Math.cos(alt));
+    const intensity=Math.max(0,sinAlt)*3.5;
+    sun.intensity=intensity;
+    amb.intensity=0.3+Math.max(0,sinAlt)*0.4;
+    renderer.toneMappingExposure=0.9+Math.max(0,sinAlt)*0.3;
+  }}
+  const altDeg=(alt*180/Math.PI).toFixed(1);
+  const azDeg=((az*180/Math.PI+360)%360).toFixed(0);
+  document.getElementById('sun-info').innerHTML=`Altitude: <b>${{altDeg}}°</b><br>Azimuth: <b>${{azDeg}}°</b><br>${{sinAlt<0.05?'⚫ Below horizon':'☀ Above horizon'}}`;
+}}
+function toggleShadow(on){{
+  renderer.shadowMap.enabled=on;
+  ['shadow-on','shadow-off'].forEach(id=>document.getElementById('btn-'+id)?.classList.toggle('active',id===('shadow-'+(on?'on':'off'))));
+}}
+updateSunPath();
+
+// ── MEASUREMENT MODE ──────────────────────────────────────────────────────────
+let measMode=false,measPts=[],measDots=[];
+const measRay=new THREE.Raycaster();
+const measHistory=[];
+
+function setMeasure(on){{
+  measMode=on;
+  measPts=[];
+  measDots.forEach(d=>d.remove());measDots=[];
+  document.getElementById('meas-result').style.display='none';
+  ['btn-meas-off','btn-meas-on'].forEach(id=>document.getElementById(id)?.classList.toggle('active',id===('btn-meas-'+(on?'on':'off'))));
+  wrap.style.cursor=on?'crosshair':'default';
+}}
+
+wrap.addEventListener('click',e=>{{
+  if(!measMode||walkMode)return;
+  getMV(e);measRay.setFromCamera(mv,camera);
+  const hits=measRay.intersectObjects([...roomMeshes,...scene.children.filter(c=>c.isMesh)]);
+  if(!hits.length)return;
+  const pt=hits[0].point;
+  measPts.push(pt.clone());
+  // Visual dot
+  const dot=document.createElement('div');dot.className='meas-dot';
+  const r=wrap.getBoundingClientRect();
+  dot.style.left=(e.clientX-r.left)+'px';dot.style.top=(e.clientY-r.top)+'px';
+  dot.style.position='absolute';
+  wrap.appendChild(dot);measDots.push(dot);
+  if(measPts.length===2){{
+    const dist=measPts[0].distanceTo(measPts[1]);
+    const ft=dist*3.2808;
+    document.getElementById('meas-m').textContent=dist.toFixed(2)+' m';
+    document.getElementById('meas-ft').textContent=ft.toFixed(2)+' ft';
+    document.getElementById('meas-result').style.display='block';
+    measHistory.unshift(dist.toFixed(2)+'m  /  '+ft.toFixed(2)+'ft');
+    if(measHistory.length>8)measHistory.pop();
+    document.getElementById('meas-history').innerHTML=measHistory.join('<br>');
+    measPts=[];
+    setTimeout(()=>{{measDots.forEach(d=>d.remove());measDots=[];}},1800);
+  }}
+}},true);
+
+// ── MATERIAL PICKER ───────────────────────────────────────────────────────────
+const MATERIALS={{
+  'Plaster (white)':0xf5f2ee,'Plaster (cream)':0xf0e8d0,'Plaster (terracotta)':0xd4886a,
+  'Exposed brick':0xb5613a,'Stone cladding':0xa09080,'Teak wood':0x8B6F47,
+  'Dark oak':0x4a2e0f,'White tile':0xe8e8e8,'Marble':0xf0ece4,
+  'Concrete':0xb0aaA0,'Paint (sage)':0x8aaa88,'Paint (slate)':0x7890a0,
+}};
+let activeMat=Object.keys(MATERIALS)[0];
+const mp=document.getElementById('mat-picker');
+Object.entries(MATERIALS).forEach(([name,hex])=>{{
+  const sw=document.createElement('span');sw.className='mat-swatch'+(name===activeMat?' active':'');
+  sw.title=name;sw.style.background='#'+hex.toString(16).padStart(6,'0');
+  sw.onclick=()=>{{activeMat=name;document.querySelectorAll('.mat-swatch').forEach(s=>s.classList.toggle('active',s.title===name));}};
+  mp.appendChild(sw);
+}});
+
+// Override click handler to also apply material when mat-picker is active
+const _origClick=wrap.onclick;
+wrap.addEventListener('click',e=>{{
+  if(walkMode||measMode)return;
+  getMV(e);ray.setFromCamera(mv,camera);
+  const hits=ray.intersectObjects(roomMeshes);
+  if(hits.length&&activeMat){{
+    const hex=MATERIALS[activeMat];
+    if(hex!==undefined){{
+      const mesh=hits[0].object;
+      mesh.material=new THREE.MeshLambertMaterial({{color:hex}});
+    }}
+  }}
+}});
+
+// ── BILL OF QUANTITIES ────────────────────────────────────────────────────────
+(function(){{
+  const BT=document.getElementById('boq-table');
+  const TOT=document.getElementById('boq-totals');
+  if(!BT)return;
+  let totalFloor=0,totalWall=0,totalCeil=0,totalDoors=0,totalWins=0;
+  let html='<table style="width:100%;border-collapse:collapse">';
+  html+='<tr style="border-bottom:1px solid rgba(200,169,110,.3)"><th style="text-align:left;padding:2px 0;font-size:9px;color:var(--muted)">Room</th><th style="text-align:right;font-size:9px;color:var(--muted)">Floor</th><th style="text-align:right;font-size:9px;color:var(--muted)">Wall</th><th style="text-align:right;font-size:9px;color:var(--muted)">Ceil</th></tr>';
+  ROOMS.forEach(r=>{{
+    const rw=r.width*PX2M,rd=r.height*PX2M,wh=r.__wall_h||2.7;
+    const floorA=(rw*rd).toFixed(1);
+    const wallA=(2*(rw+rd)*wh).toFixed(1);
+    const ceilA=(rw*rd).toFixed(1);
+    const doors=parseInt(r.door_count)||1;
+    const wins=parseInt(r.windows)||1;
+    totalFloor+=rw*rd;totalWall+=2*(rw+rd)*wh;totalCeil+=rw*rd;
+    totalDoors+=doors;totalWins+=wins;
+    html+=`<tr style="border-bottom:1px solid rgba(0,0,0,.04)">
+      <td style="padding:2px 0;font-size:9px">${{(r.__label||r.name).replace(/_/g,' ')}}</td>
+      <td style="text-align:right;font-size:9px">${{floorA}}</td>
+      <td style="text-align:right;font-size:9px">${{wallA}}</td>
+      <td style="text-align:right;font-size:9px">${{ceilA}}</td>
+    </tr>`;
+  }});
+  html+='</table>';
+  BT.innerHTML=html;
+  const conc=(totalFloor*0.125).toFixed(1);
+  const brick=(totalWall*0.24*1800/1000).toFixed(0);
+  const plaster=(totalWall*1.05).toFixed(1);
+  TOT.innerHTML=`
+    Floor area: <b>${{totalFloor.toFixed(1)}} m²</b><br>
+    Wall area: <b>${{totalWall.toFixed(1)}} m²</b><br>
+    Doors: <b>${{totalDoors}}</b> · Windows: <b>${{totalWins}}</b><br>
+    Est. concrete slab: <b>${{conc}} m³</b><br>
+    Est. brickwork: <b>${{brick}} kg</b><br>
+    Plaster area: <b>${{plaster}} m²</b>
+  `;
+}})();
+
+function exportBOQ(){{
+  let csv='Room,Floor m2,Wall m2,Ceil m2,Doors,Windows\\n';
+  ROOMS.forEach(r=>{{
+    const rw=r.width*PX2M,rd=r.height*PX2M,wh=r.__wall_h||2.7;
+    csv+=`"${{(r.__label||r.name).replace(/_/g,' ')}}",${{(rw*rd).toFixed(2)}},${{(2*(rw+rd)*wh).toFixed(2)}},${{(rw*rd).toFixed(2)}},${{r.door_count||1}},${{r.windows||1}}\\n`;
+  }});
+  const a=document.createElement('a');
+  a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);
+  a.download='boq.csv';a.click();
+}}
+
+// ── STRUCTURAL GRID ───────────────────────────────────────────────────────────
+// Auto-compute column grid from room spans. Columns at room corners that fall
+// on a regular grid (rounded to nearest 0.5m). Beams along each axis.
+let structGroup=null, structVisible=false;
+function buildStructuralGrid(){{
+  if(structGroup){{structGroup.traverse(o=>{{if(o.isMesh){{o.geometry.dispose();o.material.dispose();}}}});scene.remove(structGroup);}}
+  structGroup=new THREE.Group();
+  const colM=new THREE.MeshLambertMaterial({{color:0x607080}});
+  const beamM=new THREE.MeshLambertMaterial({{color:0x708090,transparent:true,opacity:0.7}});
+  const span=3.0; // target column spacing in metres
+  const xs=new Set(), zs=new Set();
+  ALLROOMS.forEach(r=>{{
+    const p=p2w(r.x,r.y), p2=p2w(r.x+r.width,r.y+r.height);
+    [p.x,p2.x].forEach(v=>xs.add(Math.round(v/span)*span));
+    [p.z,p2.z].forEach(v=>zs.add(Math.round(v/span)*span));
+  }});
+  const xArr=[...xs].sort((a,b)=>a-b);
+  const zArr=[...zs].sort((a,b)=>a-b);
+  const colH=totalH+0.06;
+  // Columns
+  xArr.forEach(x=>zArr.forEach(z=>{{
+    const col=new THREE.Mesh(new THREE.BoxGeometry(0.23,colH,0.23),colM);
+    col.position.set(x,colH/2,z);col.castShadow=true;structGroup.add(col);
+  }}));
+  // Beams per floor
+  for(let f=0;f<=NUM_FLOORS;f++){{
+    const by=f*FLOOR_STEP_M-0.1;
+    xArr.forEach(x=>{{
+      if(zArr.length<2)return;
+      const blen=zArr[zArr.length-1]-zArr[0];
+      const beam=new THREE.Mesh(new THREE.BoxGeometry(0.23,0.35,blen),beamM);
+      beam.position.set(x,by,zArr[0]+blen/2);structGroup.add(beam);
+    }});
+    zArr.forEach(z=>{{
+      if(xArr.length<2)return;
+      const blen=xArr[xArr.length-1]-xArr[0];
+      const beam=new THREE.Mesh(new THREE.BoxGeometry(blen,0.35,0.23),beamM);
+      beam.position.set(xArr[0]+blen/2,by,z);structGroup.add(beam);
+    }});
+  }}
+  structGroup.visible=structVisible;
+  scene.add(structGroup);
+}}
+buildStructuralGrid();
+function toggleStructGrid(on){{
+  structVisible=on;
+  if(structGroup)structGroup.visible=on;
+  ['struct-off','struct-on'].forEach(id=>document.getElementById('btn-'+id)?.classList.toggle('active',id===('struct-'+(on?'on':'off'))));
+}}
+
+// ── IFC EXPORT (simplified IFC2x3 shell) ─────────────────────────────────────
+// Generates a valid IFC2x3 file that AutoCAD/Revit/BIMx can import.
+// Includes IfcSpace per room, IfcWall stubs, IfcSlab, site/building/storey hierarchy.
+function exportIFC(){{
+  const ts=new Date().toISOString().replace(/[-:T]/g,'').slice(0,14);
+  let id=100;
+  const next=()=>++id;
+  const lines=[];
+  const H=(n,t,a)=>lines.push(`#${{n}}=${{t}}(${{a}});`);
+  // Header
+  lines.push('ISO-10303-21;');
+  lines.push('HEADER;');
+  lines.push(`FILE_DESCRIPTION(('Pascal 3D IFC Export'),'2;1');`);
+  lines.push(`FILE_NAME('pascal_export_${{ts}}.ifc','${{new Date().toISOString()}}',('Pascal'),('Pascal'),'','Pascal 3D','');`);
+  lines.push(`FILE_SCHEMA(('IFC2X3'));`);
+  lines.push('ENDSEC;');
+  lines.push('DATA;');
+  // Owner history
+  const ownerId=next();
+  H(ownerId,'IfcOwnerHistory',`#${{next()}},${{next()}},#${{next()}},$NOTDEFINED,.ADDED.,#${{next()}},$,${{Math.floor(Date.now()/1000)}}`);
+  // Project
+  const projId=next();
+  H(projId,'IfcProject',`'${{ts}}',#${{ownerId}},'Pascal Project',$,$,$,$,(#${{next()}}),#${{next()}}`);
+  // Site
+  const siteId=next();
+  H(siteId,'IfcSite',`'${{ts}}',#${{ownerId}},'Site',$,$,$,$,$,.ELEMENT.,$,$,$,$,$`);
+  // Building
+  const bldgId=next();
+  H(bldgId,'IfcBuilding',`'${{ts}}',#${{ownerId}},'Building',$,$,$,$,$,.ELEMENT.,$,$,$`);
+  // Storey per floor
+  const storeyIds=[];
+  for(let f=0;f<NUM_FLOORS;f++){{
+    const sid=next();
+    H(sid,'IfcBuildingStorey',`'Floor${{f}}',#${{ownerId}},'${{['Ground','First','Second','Third'][f]||'Floor '+f}} Floor',$,$,$,$,$,.ELEMENT.,${{(f*FLOOR_STEP_M).toFixed(3)}}`);
+    storeyIds.push({{id:sid,f}});
+  }}
+  // Spaces (rooms)
+  const spaceIds=[];
+  ALLROOMS.forEach(r=>{{
+    const floorF=Math.round((r.__floor_y||0)/FLOOR_STEP_M);
+    const pos=p2w(r.x+r.width/2,r.y+r.height/2);
+    const rw=r.width*PX2M, rd=r.height*PX2M;
+    const wh=r.__wall_h||2.7;
+    const sid=next();
+    H(sid,'IfcSpace',`'${{r.name}}',#${{ownerId}},'${{(r.__label||r.name).replace(/'/g,'')}}','${{r.__cat_resolved||'room'}}',$,$,$,$,.ELEMENT.,.INTERNAL.,${{wh.toFixed(3)}}`);
+    spaceIds.push({{id:sid,floor:floorF,room:r}});
+  }});
+  lines.push('ENDSEC;');
+  lines.push('END-ISO-10303-21;');
+  const blob=new Blob([lines.join('\\n')],{{type:'text/plain'}});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`pascal_${{ts}}.ifc`;a.click();
+}}
+
+// ── DXF EXPORT (AutoCAD-compatible 2D floor plan) ─────────────────────────────
+function exportDXF(){{
+  const lines=['0','SECTION','2','ENTITIES'];
+  ROOMS.forEach(r=>{{
+    const x0=r.x*PX2M*1000, y0=r.y*PX2M*1000; // mm
+    const x1=(r.x+r.width)*PX2M*1000, y1=(r.y+r.height)*PX2M*1000;
+    // Polyline rectangle per room
+    ['0','LWPOLYLINE',
+     '8',`FLOOR_${{(r.__cat_resolved||'room').toUpperCase()}}`,
+     '90','4','70','1', // 4 vertices, closed
+     '10',x0.toFixed(0),'20',y0.toFixed(0),
+     '10',x1.toFixed(0),'20',y0.toFixed(0),
+     '10',x1.toFixed(0),'20',y1.toFixed(0),
+     '10',x0.toFixed(0),'20',y1.toFixed(0),
+    ].forEach(l=>lines.push(l));
+    // Room label text
+    const cx=((x0+x1)/2).toFixed(0), cy=((y0+y1)/2).toFixed(0);
+    ['0','TEXT','8','ROOM_LABELS','10',cx,'20',cy,'30','0','40','200',
+     '1',(r.__label||r.name).replace(/_/g,' '),'72','1','73','2','11',cx,'21',cy
+    ].forEach(l=>lines.push(l));
+    // Dimension text
+    ['0','TEXT','8','DIMENSIONS','10',cx,'20',(parseFloat(cy)-300).toFixed(0),'30','0','40','150',
+     '1',`${{r.width_ft||Math.round(r.width*PX2M*3.281)}}\' x ${{r.depth_ft||Math.round(r.height*PX2M*3.281)}}\'`,'72','1','73','2',
+     '11',cx,'21',(parseFloat(cy)-300).toFixed(0)
+    ].forEach(l=>lines.push(l));
+  }});
+  lines.push('0','ENDSEC','0','EOF');
+  const blob=new Blob([lines.join('\\n')],{{type:'application/dxf'}});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='pascal_floorplan.dxf';a.click();
+}}
+
+// ── SHARE LINK ────────────────────────────────────────────────────────────────
+function generateShareLink(){{
+  // Encode camera state + floor + light mode into URL hash
+  const state={{th:th.toFixed(3),ph:ph.toFixed(3),cr:cr.toFixed(1),fi:0}};
+  const hash='#v='+btoa(JSON.stringify(state));
+  const url=window.location.href.split('#')[0]+hash;
+  navigator.clipboard.writeText(url).then(()=>{{
+    const btn=document.getElementById('btn-share');
+    if(btn){{btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy Share Link',1800);}}
+  }}).catch(()=>{{
+    prompt('Copy this link:',url);
+  }});
+}}
+// Restore camera from URL hash on load
+(function(){{
+  try{{
+    const h=window.location.hash;
+    if(h.startsWith('#v=')){{
+      const s=JSON.parse(atob(h.slice(3)));
+      if(s.th)th=parseFloat(s.th);
+      if(s.ph)ph=parseFloat(s.ph);
+      if(s.cr)cr=parseFloat(s.cr);
+      camUpdate();
+    }}
+  }}catch(e){{}}
+}})();
+
+// ── RESIZE + RENDER LOOP ───────────────────────────────────────────────────────
+function onResize(){{
+  const w=getW(),h=getH();
+  renderer.setSize(w,h);
+  camera.aspect=w/h;
+  camera.updateProjectionMatrix();
+}}
+window.addEventListener('resize',onResize);
+// Also observe container resize for iframe embedding
+if(typeof ResizeObserver!=='undefined'){{
+  new ResizeObserver(onResize).observe(canvasWrap||document.body);
+}}
+onResize();camUpdate();
+
+let frame=0;
+function animate(){{
+  requestAnimationFrame(animate);frame++;
+  updateWalk();
+  if(sun&&!walkMode){{sun.position.x=15*Math.cos(frame*.0005);sun.position.z=-10*Math.sin(frame*.0005);}}
+  renderer.render(scene,camera);
+  // Hide loading overlay after first real render
+  if(frame===2)hideLoading();
+}}
+animate();
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+setTimeout(hideLoading, 600);
+</script>
+</body>
+</html>"""
+
+    if output_path:
+        Path(output_path).write_text(html, encoding="utf-8")
+    return html
+
+
+def render_all_floors_3d(
+    per_floor_layouts: Dict[str, Any],
+    parsed:            Dict[str, Any],
+    per_floor_scores:  Optional[Dict[str, Any]] = None,
+    output_dir:        str = "outputs/",
+) -> Dict[str, str]:
+    _LABELS = {0:"GROUND FLOOR",1:"FIRST FLOOR",2:"SECOND FLOOR",3:"THIRD FLOOR"}
+    _SLUGS  = {0:"ground",1:"first",2:"second",3:"third"}
+    out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
+    all_layouts = [per_floor_layouts.get(str(i),{}) for i in range(len(per_floor_layouts))]
+    results: Dict[str, str] = {}
+    for idx_str, layout_data in per_floor_layouts.items():
+        idx   = int(idx_str)
+        score = (per_floor_scores or {}).get(idx_str)
+        path  = str(out / f"3d_floor_{_SLUGS.get(idx,str(idx))}.html")
+        html  = render_3d_html(
+            layout_data=layout_data, parsed=parsed, score=score,
+            floor_label=_LABELS.get(idx,f"FLOOR {idx}"),
+            output_path=path, floor_index=idx, all_floors=all_layouts,
+        )
+        results[idx_str] = html
+    return results

@@ -1,0 +1,4 @@
+# Optional Supabase client dependency.
+# On Python 3.14 on Windows, some transitive dependencies may require MSVC Build Tools.
+supabase==2.28.0
+
