@@ -1,6 +1,8 @@
 # app/main.py
 
 import os
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,10 +18,17 @@ from app.routers.editor_route import router as editor_router
 from app.routers.layout_route import router as layout_router
 
 # ── App init MUST come before include_router ──────────────────────────────────
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    Path("outputs").mkdir(parents=True, exist_ok=True)
+    yield
+
+
 app = FastAPI(
     title="AI Architecture Design API",
     description="Backend for AI architecture design prototype",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 # ── Router registration (after app = FastAPI()) ───────────────────────────────
@@ -46,9 +55,16 @@ def _cors_origins() -> list[str]:
     return origins
 
 
+def _cors_origin_regex() -> str | None:
+    """Optional regex for preview hosts (e.g. all *.vercel.app)."""
+    pattern = os.getenv("ALLOWED_ORIGIN_REGEX", "").strip()
+    return pattern or None
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
+    allow_origin_regex=_cors_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

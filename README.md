@@ -155,7 +155,8 @@ Then open http://localhost:3000 and http://localhost:8000/docs.
 2. Set **Root Directory** to `backend`.
 3. Add variables (Railway → Variables):
    - `OPENAI_API_KEY` — required for LLM parsing
-   - `ALLOWED_ORIGINS` — your Vercel URL(s), comma-separated, e.g. `https://my-app.vercel.app`
+   - `ALLOWED_ORIGIN_REGEX` — `https://.*\.vercel\.app` (covers production + preview deploys)
+   - Optional: `ALLOWED_ORIGINS` — extra origins, comma-separated (e.g. a custom domain)
    - Optional: `SUPABASE_URL`, `SUPABASE_KEY`
 4. Deploy. Copy the public URL (e.g. `https://xxx.up.railway.app`).
 5. Confirm health: open `https://xxx.up.railway.app/health`.
