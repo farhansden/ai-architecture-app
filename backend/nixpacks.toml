@@ -1,3 +1,10 @@
-# Cairo libs for cairosvg (SVG → PNG) on Railway/Linux
+# Cairo libs for cairosvg (SVG → PNG) on Railway/Linux.
+# "..." extends Nixpacks defaults (including Python) — do not replace them.
 [phases.setup]
-nixPkgs = ["cairo", "pango", "gdk-pixbuf", "pkg-config"]
+aptPkgs = [
+  "...",
+  "libcairo2-dev",
+  "libpango1.0-dev",
+  "libgdk-pixbuf2.0-dev",
+  "pkg-config",
+]
