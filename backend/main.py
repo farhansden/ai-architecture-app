@@ -56,8 +56,13 @@ def _cors_origins() -> list[str]:
 
 
 def _cors_origin_regex() -> str | None:
-    """Optional regex for preview hosts (e.g. all *.vercel.app)."""
+    """
+    Regex matched with fullmatch() against the Origin header.
+    On Railway, defaults to all *.vercel.app if ALLOWED_ORIGIN_REGEX is unset.
+    """
     pattern = os.getenv("ALLOWED_ORIGIN_REGEX", "").strip()
+    if not pattern and os.getenv("RAILWAY_ENVIRONMENT"):
+        pattern = r"^https://[\w.-]+\.vercel\.app$"
     return pattern or None
 
 
