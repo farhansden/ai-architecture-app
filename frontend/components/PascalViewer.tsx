@@ -26,6 +26,7 @@
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { getApiBase } from "@/lib/apiBase";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -76,6 +77,7 @@ interface PascalViewerProps {
   perFloorLayouts: Record<string, FloorLayout>;
   parsed: ParsedJSON;
   projectName?: string;
+  apiBase?: string;
   mode?: "iframe" | "tab" | "panel";
   height?: number | string;
   onSceneReady?: (scene: Record<string, unknown>) => void;
@@ -141,15 +143,29 @@ function getRoomLabel(room: Room): string {
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 
+function pascalSceneFromResponse(data: Record<string, unknown>): ConvertResult {
+  const scene_json = (data.scene_json ?? data) as Record<string, unknown>;
+  const nodes = (scene_json.nodes ?? {}) as Record<string, unknown>;
+  return {
+    job_id: String(data.job_id ?? ""),
+    scene_json,
+    node_count: Object.keys(nodes).length,
+    viewer_url: String(data.viewer_url ?? ""),
+    scene_url: String(data.scene_url ?? ""),
+  };
+}
+
 export function PascalViewer({
   perFloorLayouts,
   parsed,
   projectName = "Floor Plan",
+  apiBase = getApiBase(),
   mode = "iframe",
   height = 600,
   onSceneReady,
   className = "",
 }: PascalViewerProps) {
+  const api = apiBase.trim().replace(/\/+$/, "");
   const [status, setStatus] = useState<"idle" | "converting" | "ready" | "error">("idle");
   const [result, setResult] = useState<ConvertResult | null>(null);
   const [error, setError] = useState<string>("");
@@ -170,7 +186,7 @@ export function PascalViewer({
     setError("");
 
     try {
-      const resp = await fetch("/api/pascal/from-layout", {
+      const resp = await fetch(`${api}/api/pascal/scene/multi`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -185,7 +201,7 @@ export function PascalViewer({
         throw new Error(`API error ${resp.status}: ${err}`);
       }
 
-      const data: ConvertResult = await resp.json();
+      const data = pascalSceneFromResponse(await resp.json());
       setResult(data);
       setStatus("ready");
       onSceneReady?.(data.scene_json);
@@ -193,7 +209,7 @@ export function PascalViewer({
       setError(e instanceof Error ? e.message : String(e));
       setStatus("error");
     }
-  }, [perFloorLayouts, parsed, projectName, onSceneReady]);
+  }, [api, perFloorLayouts, parsed, projectName, onSceneReady]);
 
   // ── Open in Pascal Editor (new tab) ───────────────────────────────────────
   const openInPascal = useCallback(() => {
@@ -384,7 +400,10 @@ export function PascalViewer({
       {mode === "iframe" ? (
         <iframe
           ref={iframeRef}
-          src={`/api/pascal/viewer/${result.job_id}`}
+          src={
+            result.viewer_url ||
+            (result.job_id ? `${api}/api/pascal/viewer/${result.job_id}` : undefined)
+          }
           style={{ ...styles.iframe, height }}
           title="Pascal 3D Editor"
           allow="cross-origin-isolated"
@@ -408,7 +427,7 @@ export function PascalViewer({
           </button>
           <div style={styles.panelNote}>
             Tip: In Pascal Editor, use{" "}
-            <strong>File → Import Scene</strong> if the URL param doesn't work.
+            <strong>File → Import Scene</strong> if the URL param does not work.
           </div>
         </div>
       )}
@@ -422,13 +441,15 @@ export function PascalLaunchButton({
   perFloorLayouts,
   parsed,
   projectName = "Floor Plan",
-}: Pick<PascalViewerProps, "perFloorLayouts" | "parsed" | "projectName">) {
+  apiBase = getApiBase(),
+}: Pick<PascalViewerProps, "perFloorLayouts" | "parsed" | "projectName" | "apiBase">) {
   const [loading, setLoading] = useState(false);
+  const api = apiBase.trim().replace(/\/+$/, "");
 
   const launch = async () => {
     setLoading(true);
     try {
-      const resp = await fetch("/api/pascal/from-layout", {
+      const resp = await fetch(`${api}/api/pascal/scene/multi`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -437,7 +458,7 @@ export function PascalLaunchButton({
           project_name: projectName,
         }),
       });
-      const data = await resp.json();
+      const data = pascalSceneFromResponse(await resp.json());
       if (data.scene_json) {
         const sceneStr = JSON.stringify(data.scene_json);
         const b64 = btoa(unescape(encodeURIComponent(sceneStr)))

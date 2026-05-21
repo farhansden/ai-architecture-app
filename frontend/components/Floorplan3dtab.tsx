@@ -2,7 +2,7 @@
 // Drop this next to your existing floor plan SVG viewer.
 // Reads `floors_3d` from the /generate API response.
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, type CSSProperties } from "react";
 
 /**
  * FloorPlan3DTab
@@ -12,12 +12,25 @@ import { useState, useRef, useEffect } from "react";
  *                         from API response key `floors_3d`
  *   floorCount: number  — total floors (default 1)
  */
-export default function FloorPlan3DTab({ floors3d = {}, floorCount = 1 }) {
+type Floors3dMap = Record<string, string>;
+
+export default function FloorPlan3DTab({
+  floors3d = {} as Floors3dMap,
+  floorCount = 1,
+}: {
+  floors3d?: Floors3dMap;
+  floorCount?: number;
+}) {
   const [activeFloor, setActiveFloor] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const iframeRef = useRef(null);
 
-  const FLOOR_LABELS = { 0: "Ground Floor", 1: "First Floor", 2: "Second Floor", 3: "Third Floor" };
+  const FLOOR_LABELS: Record<number, string> = {
+    0: "Ground Floor",
+    1: "First Floor",
+    2: "Second Floor",
+    3: "Third Floor",
+  };
 
   // The HTML string for the currently selected floor
   const activeHtml = floors3d[String(activeFloor)] || "";
@@ -136,7 +149,7 @@ export default function FloorPlan3DTab({ floors3d = {}, floorCount = 1 }) {
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
-const styles = {
+const styles: Record<string, CSSProperties> = {
   wrap: {
     display: "flex",
     flexDirection: "column",

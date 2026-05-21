@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     ollama_url: str = "http://localhost:11434"  # OLLAMA_URL
     ollama_model: str = "phi3"  # OLLAMA_MODEL
     openai_model: str = "gpt-4o-mini"  # OPENAI_MODEL
-    openai_api_key: str = "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"  # OPENAI_API_KEY
+    openai_api_key: str = ""  # OPENAI_API_KEY — set in Railway / .env, never commit
 
     class Config:
         env_file = ".env"

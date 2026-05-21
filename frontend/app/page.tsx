@@ -8,9 +8,9 @@ import ResultPanel from '@/components/ResultPanel';
 import type { GenerateApiResult } from '@/components/ResultPanel';
 import { requestFloorPlanGeneration } from '@/lib/generateFloorPlan';
 
-const API_BASE = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000')
-  .trim()
-  .replace(/\/+$/, '');
+import { getApiBase } from '@/lib/apiBase';
+
+const API_BASE = getApiBase();
 
 export default function Home() {
   const [prompt, setPrompt]       = useState('');

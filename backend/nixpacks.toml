@@ -1,0 +1,3 @@
+# Cairo libs for cairosvg (SVG → PNG) on Railway/Linux
+[phases.setup]
+nixPkgs = ["cairo", "pango", "gdk-pixbuf", "pkg-config"]

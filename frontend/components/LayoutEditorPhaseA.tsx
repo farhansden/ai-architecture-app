@@ -2116,9 +2116,6 @@ export function LayoutEditorPhaseA({
             }}
             onPointerUp={endDrag}
             onPointerCancel={endDrag}
-            onSelectStart={(e) => {
-              e.preventDefault();
-            }}
             onWheel={onWheel}
             style={editorWrapSurfaceStyle(true)}
           >
@@ -2135,9 +2132,6 @@ export function LayoutEditorPhaseA({
           }}
           onPointerUp={endDrag}
           onPointerCancel={endDrag}
-          onSelectStart={(e) => {
-            e.preventDefault();
-          }}
           onWheel={onWheel}
           style={editorWrapSurfaceStyle(false)}
         >

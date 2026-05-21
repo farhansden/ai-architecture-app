@@ -1,5 +1,7 @@
 # app/main.py
 
+import os
+
 from fastapi import FastAPI, HTTPException, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse, HTMLResponse
@@ -25,9 +27,8 @@ app.include_router(pascal_router, prefix="/api/pascal", tags=["pascal"])
 app.include_router(editor_router)
 app.include_router(layout_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+def _cors_origins() -> list[str]:
+    origins = [
         "http://localhost:3000",
         "http://localhost:3001",
         "http://localhost:3002",
@@ -36,7 +37,18 @@ app.add_middleware(
         "http://localhost:3005",
         "http://localhost:5173",
         "http://localhost:8080",
-    ],
+    ]
+    extra = os.getenv("ALLOWED_ORIGINS", "")
+    for origin in extra.split(","):
+        o = origin.strip()
+        if o and o not in origins:
+            origins.append(o)
+    return origins
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

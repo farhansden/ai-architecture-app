@@ -147,6 +147,39 @@ Then open http://localhost:3000 and http://localhost:8000/docs.
 
 ---
 
+## Production: Vercel (frontend) + Railway (backend)
+
+### Railway — backend
+
+1. Create a project at [railway.app](https://railway.app) and connect this repo.
+2. Set **Root Directory** to `backend`.
+3. Add variables (Railway → Variables):
+   - `OPENAI_API_KEY` — required for LLM parsing
+   - `ALLOWED_ORIGINS` — your Vercel URL(s), comma-separated, e.g. `https://my-app.vercel.app`
+   - Optional: `SUPABASE_URL`, `SUPABASE_KEY`
+4. Deploy. Copy the public URL (e.g. `https://xxx.up.railway.app`).
+5. Confirm health: open `https://xxx.up.railway.app/health`.
+
+Railway uses `backend/railway.toml` and `backend/requirements.txt`.
+
+### Vercel — frontend only
+
+1. Import the repo at [vercel.com](https://vercel.com).
+2. **Root Directory** → `frontend` (not the repo root).
+3. **Framework** → Next.js (not Services).
+4. Environment variable:
+   - `NEXT_PUBLIC_API_URL` = your Railway URL (no trailing slash)
+5. Deploy.
+
+Do **not** add `experimentalServices` in a root `vercel.json` unless you want both apps on Vercel.
+
+### After deploy
+
+- Regenerate on Vercel only works if `NEXT_PUBLIC_API_URL` points at Railway.
+- If you change the Vercel domain, update `ALLOWED_ORIGINS` on Railway and redeploy the API.
+
+---
+
 ## License
 
 MIT (or your choice).
